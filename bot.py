@@ -9,26 +9,30 @@ import traceback
 from datetime import datetime
 
 # ============================================================
-# DELTA XAUTUSD GRID BOT (ULTIMATE FINAL)
+# DELTA XAUTUSD GRID BOT (FINAL + POSITION MISMATCH FIX)
 # ============================================================
-# COMPLETE FEATURES (NOTHING MISSING):
+# INCLUDED (NOTHING MISSING):
 #
 # ✅ Lock system (bot.lock)
 # ✅ State save/load (state.json)
-# ✅ Manual trade sync via fills
-# ✅ Restart recovery from fills
+# ✅ Manual trade sync (fills)
+# ✅ Restart safe recovery (NO wrong rebuild)
 # ✅ Position 0 -> Multiplier entry (LOT_SIZE * ENTRY_MULTIPLIER)
-# ✅ Down move -> grid buys (LOT_SIZE each GRID step)
-# ✅ Each buy has its own sell target (buy_price + GRID)
-# ✅ Sell triggers only that level qty at its sell_price
-# ✅ Multi-buy in same loop if price jumps down multiple levels
-# ✅ Multi-sell in same loop if price jumps up multiple levels
+# ✅ cycle_entry_size logic (original code preserved)
+# ✅ Downside -> grid buys (LOT_SIZE each GRID step)
+# ✅ Every buy creates its own sell target (buy_price + GRID)
+# ✅ Cycle batch (50 lot) sells only at its own sell target
+# ✅ Small 5-5 lots sell at their own target
+# ✅ Multi-buy in same loop if price jumps down multiple grids
+# ✅ Multi-sell in same loop if price jumps up multiple grids
 # ✅ No short sell protection
 # ✅ Duplicate action guard
-# ✅ Partial buy fill supported
-# ✅ Partial sell fill supported
-# ✅ Multi-fill support (same order multiple fills summed)
-# ✅ Manual sell tolerance support (fills may not match exact sell_price)
+# ✅ Partial BUY fill supported
+# ✅ Partial SELL fill supported
+# ✅ Multi-fill supported (fills processed individually)
+# ✅ Manual sell tolerance fix
+# ✅ FIXED LIVE ISSUE: No wrong rebuild from old fills
+# ✅ NEW PROTECTION: if pos_size != sum(level sizes) -> auto recover
 # ============================================================
 
 BASE_URL = "https://api.india.delta.exchange"
@@ -49,7 +53,7 @@ API_SECRET = os.getenv("DELTA_API_SECRET")
 STATE_FILE = "state.json"
 LOCK_FILE = "bot.lock"
 
-USER_AGENT = "xautusd-grid-bot-ULTIMATE-FINAL"
+USER_AGENT = "xautusd-grid-bot-FINAL-MISMATCH-PROTECT"
 
 print("BOT FILE RUNNING...")
 sys.stdout.flush()
@@ -101,7 +105,10 @@ acquire_lock()
 def default_state():
     return {
         "levels": [],
-        # {"buy_price": x, "sell_price": x+GRID, "size": size}
+
+        "cycle_entry_size": None,
+        "cycle_entry_price": None,
+        "cycle_entry_sell_price": None,
 
         "last_action": None,
         "last_action_price": None,
@@ -111,7 +118,6 @@ def default_state():
         "last_fill_price": None,
         "last_fill_side": None,
 
-        # for multi-fill tracking
         "processed_fill_ids": []
     }
 
@@ -133,9 +139,8 @@ def load_state():
         if d.get("processed_fill_ids") is None:
             d["processed_fill_ids"] = []
 
-        # safety cap processed list
-        if len(d["processed_fill_ids"]) > 2000:
-            d["processed_fill_ids"] = d["processed_fill_ids"][-1000:]
+        if len(d["processed_fill_ids"]) > 5000:
+            d["processed_fill_ids"] = d["processed_fill_ids"][-2000:]
 
         return d
     except:
@@ -257,13 +262,21 @@ def get_open_position_size():
     return 0.0
 
 
-def get_fills(page_size=100):
+def get_fills(page_size=200):
     data = private_get("/v2/fills", params={"page_size": page_size})
 
     if data.get("success") is not True:
         raise Exception("Fills API failed: " + str(data))
 
     return data.get("result", [])
+
+
+def get_last_buy_fill():
+    fills = get_fills(page_size=200)
+    for f in fills:
+        if f.get("product_symbol") == SYMBOL and f.get("side") == "buy":
+            return f
+    return None
 
 
 def place_market_order(side: str, size: float):
@@ -299,7 +312,7 @@ def mark_action(action, price, order_id=None):
 
 
 # ============================================================
-# LEVEL MANAGEMENT (PARTIAL SUPPORT)
+# LEVEL MANAGEMENT
 # ============================================================
 
 def sort_levels():
@@ -307,7 +320,7 @@ def sort_levels():
     save_state(state)
 
 
-def add_level(buy_price, size):
+def add_level(buy_price, size, is_cycle=False):
     buy_price = float(buy_price)
     size = float(size)
 
@@ -317,14 +330,15 @@ def add_level(buy_price, size):
     level = {
         "buy_price": buy_price,
         "sell_price": buy_price + GRID,
-        "size": size
+        "size": size,
+        "is_cycle": bool(is_cycle)
     }
 
     state["levels"].append(level)
     sort_levels()
 
 
-def reduce_level_by_sell_price(sell_price, sold_size):
+def reduce_exact_sell_level(sell_price, sold_size):
     sell_price = float(sell_price)
     sold_size = float(sold_size)
 
@@ -345,18 +359,12 @@ def reduce_level_by_sell_price(sell_price, sold_size):
 
 
 def reduce_closest_sell_level(fill_price, sold_size):
-    """
-    Manual sell tolerance:
-    if fill price doesn't match exact sell_price,
-    find closest sell_price within tolerance.
-    """
     if not state["levels"]:
         return None
 
     fill_price = float(fill_price)
     sold_size = float(sold_size)
 
-    closest = None
     closest_index = None
     closest_diff = 999999
 
@@ -364,14 +372,15 @@ def reduce_closest_sell_level(fill_price, sold_size):
         diff = abs(float(lv["sell_price"]) - fill_price)
         if diff < closest_diff:
             closest_diff = diff
-            closest = lv
             closest_index = i
 
-    # tolerance: must be within 2 points
-    if closest is None or closest_diff > 2.0:
+    if closest_index is None:
         return None
 
-    current_size = float(closest["size"])
+    if closest_diff > 3.0:
+        return None
+
+    current_size = float(state["levels"][closest_index]["size"])
 
     if sold_size >= current_size:
         removed = state["levels"].pop(closest_index)
@@ -406,7 +415,17 @@ def get_next_sell_target(price):
 
 def reset_all_levels():
     state["levels"] = []
+    state["cycle_entry_size"] = None
+    state["cycle_entry_price"] = None
+    state["cycle_entry_sell_price"] = None
     save_state(state)
+
+
+def get_total_level_size():
+    total = 0.0
+    for lv in state["levels"]:
+        total += float(lv.get("size", 0))
+    return float(total)
 
 
 # ============================================================
@@ -421,31 +440,29 @@ def calculate_reentry_size():
 
 
 # ============================================================
-# PROCESS NEW FILLS (MULTI-FILL SAFE)
+# PROCESS NEW FILLS
 # ============================================================
 
 def process_new_fills():
-    """
-    Reads recent fills and applies those not processed yet.
-    Supports multiple fills from same order.
-    """
     fills = get_fills(page_size=200)
 
     new_fills = []
     for f in fills:
         if f.get("product_symbol") != SYMBOL:
             continue
+
         fid = f.get("id")
         if fid is None:
             continue
+
         if fid in state["processed_fill_ids"]:
             continue
+
         new_fills.append(f)
 
     if not new_fills:
         return
 
-    # process oldest first
     new_fills = sorted(new_fills, key=lambda x: x.get("created_at", ""))
 
     for f in new_fills:
@@ -462,10 +479,14 @@ def process_new_fills():
         sys.stdout.flush()
 
         if fill_side == "buy":
-            add_level(fill_price, fill_size)
+            # cycle buy detection
+            if state.get("cycle_entry_size") is not None and abs(fill_size - state["cycle_entry_size"]) < 0.01:
+                add_level(fill_price, fill_size, is_cycle=True)
+            else:
+                add_level(fill_price, fill_size, is_cycle=False)
 
         elif fill_side == "sell":
-            removed = reduce_level_by_sell_price(fill_price, fill_size)
+            removed = reduce_exact_sell_level(fill_price, fill_size)
             if removed is None:
                 reduce_closest_sell_level(fill_price, fill_size)
 
@@ -475,71 +496,65 @@ def process_new_fills():
 
         state["processed_fill_ids"].append(fid)
 
-    # cap processed list
-    if len(state["processed_fill_ids"]) > 2000:
-        state["processed_fill_ids"] = state["processed_fill_ids"][-1000:]
+    if len(state["processed_fill_ids"]) > 5000:
+        state["processed_fill_ids"] = state["processed_fill_ids"][-2000:]
 
     save_state(state)
 
-    # if position is 0 reset everything
     pos_size = get_open_position_size()
     if pos_size <= 0:
         reset_all_levels()
 
 
 # ============================================================
-# STARTUP RECOVERY (REBUILD LEVELS FROM FILLS)
+# SAFE RECOVERY / MISMATCH AUTO FIX
 # ============================================================
 
-def rebuild_levels_from_fills():
-    """
-    Rebuild grid levels by replaying fills history.
-    This is best recovery method.
-    """
-    print("REBUILDING LEVELS FROM FILLS HISTORY...")
+def safe_recover_from_last_buy(pos_size):
+    last_buy = get_last_buy_fill()
+
+    if last_buy is None:
+        print("SAFE RECOVERY FAILED: NO LAST BUY FILL FOUND -> RESETTING")
+        reset_all_levels()
+        return
+
+    buy_price = float(last_buy["price"])
+
+    print("SAFE RECOVERY -> LAST BUY PRICE:", buy_price, "POS SIZE:", pos_size)
     sys.stdout.flush()
 
     reset_all_levels()
-    state["processed_fill_ids"] = []
+
+    state["cycle_entry_size"] = pos_size
+    state["cycle_entry_price"] = buy_price
+    state["cycle_entry_sell_price"] = buy_price + GRID
     save_state(state)
 
-    fills = get_fills(page_size=200)
+    add_level(buy_price, pos_size, is_cycle=True)
 
-    # take only symbol fills
-    symbol_fills = [f for f in fills if f.get("product_symbol") == SYMBOL]
 
-    # oldest first
-    symbol_fills = sorted(symbol_fills, key=lambda x: x.get("created_at", ""))
+def mismatch_protection_check():
+    pos_size = get_open_position_size()
 
-    for f in symbol_fills:
-        fid = f.get("id")
-        if fid is None:
-            continue
+    if pos_size <= 0:
+        reset_all_levels()
+        return
 
-        fill_price = float(f.get("price"))
-        fill_side = f.get("side")
-        fill_size = float(f.get("size", 0))
+    total_levels = get_total_level_size()
 
-        if fill_size <= 0:
-            continue
+    if not state["levels"]:
+        print("LEVELS EMPTY BUT POSITION EXISTS -> RECOVERING")
+        safe_recover_from_last_buy(pos_size)
+        return
 
-        if fill_side == "buy":
-            add_level(fill_price, fill_size)
+    # mismatch tolerance 0.01
+    if abs(total_levels - pos_size) > 0.01:
+        print("POSITION MISMATCH DETECTED !!!")
+        print("EXCHANGE POS:", pos_size, "STATE LEVEL SUM:", total_levels)
+        print("AUTO RECOVERING NOW...")
+        sys.stdout.flush()
 
-        elif fill_side == "sell":
-            removed = reduce_level_by_sell_price(fill_price, fill_size)
-            if removed is None:
-                reduce_closest_sell_level(fill_price, fill_size)
-
-        state["processed_fill_ids"].append(fid)
-
-    if len(state["processed_fill_ids"]) > 2000:
-        state["processed_fill_ids"] = state["processed_fill_ids"][-1000:]
-
-    save_state(state)
-
-    print("REBUILD DONE. LEVELS:", state["levels"])
-    sys.stdout.flush()
+        safe_recover_from_last_buy(pos_size)
 
 
 # ============================================================
@@ -557,13 +572,7 @@ try:
     print("STARTUP POS SIZE:", pos_size)
     sys.stdout.flush()
 
-    # if open position exists but state empty -> rebuild from fills
-    if pos_size > 0 and not state["levels"]:
-        rebuild_levels_from_fills()
-
-    # if no position -> reset state
-    if pos_size <= 0:
-        reset_all_levels()
+    mismatch_protection_check()
 
 except Exception as e:
     print("STARTUP ERROR:", str(e))
@@ -583,8 +592,10 @@ try:
             ENTRY_MULTIPLIER = float(os.getenv("ENTRY_MULTIPLIER", "10"))
             MAX_REENTRY_SIZE = float(os.getenv("MAX_REENTRY_SIZE", "200"))
 
-            # process new fills (manual + bot trades + partial fills)
             process_new_fills()
+
+            # mismatch check every loop (important)
+            mismatch_protection_check()
 
             price = get_live_price()
             pos_size = get_open_position_size()
@@ -601,6 +612,8 @@ try:
                 sys.stdout.flush()
 
                 entry_size = calculate_reentry_size()
+                state["cycle_entry_size"] = entry_size
+                save_state(state)
 
                 resp = place_market_order("buy", entry_size)
 
@@ -608,9 +621,18 @@ try:
                     order_id = resp.get("result", {}).get("id")
                     mark_action("buy", price, order_id)
 
-                    # after placing order, wait and sync fills
                     time.sleep(1)
                     process_new_fills()
+
+                    last_buy = get_last_buy_fill()
+                    if last_buy:
+                        fill_price = float(last_buy["price"])
+                    else:
+                        fill_price = price
+
+                    state["cycle_entry_price"] = fill_price
+                    state["cycle_entry_sell_price"] = fill_price + GRID
+                    save_state(state)
 
                 time.sleep(SLEEP_SECONDS)
                 continue
@@ -659,6 +681,7 @@ try:
                 if already_executed_same_price("sell", sell_price):
                     break
 
+                # strict no short
                 sell_size = min(sell_size, pos_size)
 
                 if sell_size <= 0:
@@ -696,4 +719,4 @@ except KeyboardInterrupt:
     sys.stdout.flush()
 
 finally:
-    release_lock()
+    release_
