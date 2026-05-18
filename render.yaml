@@ -1,0 +1,7 @@
+services:
+  - type: worker
+    name: xaut-grid-bot
+    env: python
+    plan: free
+    buildCommand: ""
+    startCommand: "python -u bot.py"
