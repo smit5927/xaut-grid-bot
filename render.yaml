@@ -1,7 +1,7 @@
 services:
-  - type: worker
+  - type: web
     name: xaut-grid-bot
     env: python
     plan: free
     buildCommand: ""
-    startCommand: "python -u bot.py"
+    startCommand: "python -m http.server ${PORT:-10000} & python -u bot.py"
