@@ -22,16 +22,17 @@ from datetime import datetime
 # MAX_REENTRY_SIZE    = 200     (default)  -> safety cap (maximum lots bot can buy in re-entry)
 #
 # IMPORTANT:
-# Bot will NEVER SHORT SELL
+# Bot will NEVER SHORT SELL (sell size always min(pos_size, LOT_SIZE or cycle_entry_size))
 # Manual trade sync is included.
 # ============================================================
 
 BASE_URL = "https://api.india.delta.exchange"
 
-# ============================
-# CHANGE SYMBOL HERE
-# ============================
+# ============================================================
+# XAUTUSD SETTINGS
+# ============================================================
 SYMBOL = "XAUTUSD"
+PRODUCT_ID = 131253   # XAUTUSD product id confirmed by Delta Exchange
 
 GRID = float(os.getenv("GRID", "15"))
 LOT_SIZE = float(os.getenv("LOT_SIZE", "1"))
@@ -46,13 +47,14 @@ API_SECRET = os.getenv("DELTA_API_SECRET")
 STATE_FILE = "state.json"
 LOCK_FILE = "bot.lock"
 
-USER_AGENT = "xaut-grid-bot-ultra-stable-FINAL"
+USER_AGENT = "xautusd-grid-bot-ultra-stable-FINAL"
 
 print("BOT FILE RUNNING...")
 sys.stdout.flush()
 
 print("BOT STARTED...")
 print("SYMBOL:", SYMBOL)
+print("PRODUCT_ID:", PRODUCT_ID)
 print("GRID:", GRID)
 print("LOT_SIZE:", LOT_SIZE)
 print("SLEEP_SECONDS:", SLEEP_SECONDS)
@@ -108,7 +110,10 @@ def default_state():
         "last_fill_price": None,
         "last_fill_side": None,
 
-        # stores current cycle entry size
+        # NEW IMPORTANT:
+        # This stores current "cycle entry size"
+        # If position becomes 0, bot buys LOT_SIZE*ENTRY_MULTIPLIER
+        # and remembers that size until position becomes 0 again.
         "cycle_entry_size": None
     }
 
@@ -275,7 +280,7 @@ def get_last_buy_fill_price():
 
 def place_market_order(side: str, size: float):
     payload = {
-        "product_symbol": SYMBOL,
+        "product_id": PRODUCT_ID,
         "size": size,
         "side": side,
         "order_type": "market_order"
@@ -331,6 +336,10 @@ def mark_action(action, price, order_id=None):
 # ============================================================
 
 def sync_with_exchange_fills():
+    """
+    If manual buy/sell happened, bot will auto update base_price/levels
+    AND also adjust cycle_entry_size if needed.
+    """
     last_fill = get_last_fill()
     if last_fill is None:
         return
@@ -353,9 +362,12 @@ def sync_with_exchange_fills():
         state["last_fill_price"] = fill_price
         state["last_fill_side"] = fill_side
 
+        # reset duplicate guard
         state["last_action"] = None
         state["last_action_price"] = None
 
+        # NEW: if manual trade caused position to become 0,
+        # reset cycle_entry_size so next entry becomes multiplier entry again.
         pos_size = get_open_position_size()
         if pos_size <= 0:
             print("MANUAL TRADE MADE POSITION 0 -> RESETTING CYCLE ENTRY SIZE")
@@ -372,6 +384,10 @@ def sync_with_exchange_fills():
 # ============================================================
 
 def calculate_reentry_size():
+    """
+    Returns the re-entry buy size when position becomes 0.
+    Uses LOT_SIZE * ENTRY_MULTIPLIER but capped by MAX_REENTRY_SIZE.
+    """
     size = LOT_SIZE * ENTRY_MULTIPLIER
     if size > MAX_REENTRY_SIZE:
         size = MAX_REENTRY_SIZE
@@ -379,6 +395,10 @@ def calculate_reentry_size():
 
 
 def ensure_cycle_entry_size_initialized():
+    """
+    If cycle_entry_size is missing, set it now.
+    This happens only when position becomes 0.
+    """
     if state.get("cycle_entry_size") is None:
         state["cycle_entry_size"] = calculate_reentry_size()
         save_state(state)
@@ -401,12 +421,14 @@ try:
     print("STARTUP POS SIZE:", pos_size)
     sys.stdout.flush()
 
+    # If no position -> reset state
     if pos_size <= 0:
         state = default_state()
         save_state(state)
         print("NO POSITION FOUND -> STATE RESET")
         sys.stdout.flush()
 
+    # If position exists but grid missing -> recover from exchange buy fill
     if pos_size > 0 and (state["base_price"] is None or state["next_buy"] is None or state["next_sell"] is None):
         exchange_last_buy = get_last_buy_fill_price()
         print("EXCHANGE LAST BUY FILL:", exchange_last_buy)
@@ -417,6 +439,8 @@ try:
             print("RECOVERED LEVELS FROM EXCHANGE:", state)
             sys.stdout.flush()
 
+    # If position exists and cycle_entry_size missing -> set to LOT_SIZE (normal)
+    # Because this is already running cycle.
     if pos_size > 0 and state.get("cycle_entry_size") is None:
         state["cycle_entry_size"] = LOT_SIZE
         save_state(state)
@@ -436,11 +460,13 @@ except Exception as e:
 try:
     while True:
         try:
+            # Reload env live
             LOT_SIZE = float(os.getenv("LOT_SIZE", "1"))
             GRID = float(os.getenv("GRID", "15"))
             ENTRY_MULTIPLIER = float(os.getenv("ENTRY_MULTIPLIER", "10"))
             MAX_REENTRY_SIZE = float(os.getenv("MAX_REENTRY_SIZE", "200"))
 
+            # Sync manual trades every loop
             sync_with_exchange_fills()
 
             price = get_live_price()
@@ -461,6 +487,7 @@ try:
                 ensure_cycle_entry_size_initialized()
                 entry_size = float(state["cycle_entry_size"])
 
+                # Safety cap
                 if entry_size > MAX_REENTRY_SIZE:
                     entry_size = MAX_REENTRY_SIZE
 
@@ -536,7 +563,7 @@ try:
                     sys.stdout.flush()
 
             # ============================================================
-            # GRID SELL (SELL SAME SIZE AS ENTRY MULTIPLIER LOT)
+            # GRID SELL (SELL MUST MATCH CURRENT CYCLE ENTRY LOGIC)
             # ============================================================
             elif price >= next_sell:
 
@@ -546,13 +573,22 @@ try:
                     time.sleep(SLEEP_SECONDS)
                     continue
 
+                # Determine sell size:
+                # If cycle_entry_size exists, we try to close that same size in grid sell.
                 cycle_entry_size = state.get("cycle_entry_size")
                 if cycle_entry_size is None:
                     cycle_entry_size = LOT_SIZE
 
-                desired_sell = float(cycle_entry_size)
+                desired_sell = min(float(cycle_entry_size), LOT_SIZE)
 
-                # STRICT NO SHORT SELL
+                # IMPORTANT:
+                # If cycle_entry_size is bigger than LOT_SIZE (example 50),
+                # then selling should also be that full 50 when grid sell hits.
+                # So we override desired_sell:
+                if float(cycle_entry_size) > LOT_SIZE:
+                    desired_sell = float(cycle_entry_size)
+
+                # STRICT NO SHORT SELL PROTECTION
                 sell_size = min(desired_sell, pos_size)
 
                 if sell_size <= 0:
@@ -575,6 +611,7 @@ try:
                     print("SELL CONFIRMED -> UPDATED LEVELS:", state)
                     sys.stdout.flush()
 
+                    # If after selling, position becomes 0 -> reset cycle_entry_size
                     time.sleep(1)
                     new_pos = get_open_position_size()
                     if new_pos <= 0:
