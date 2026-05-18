@@ -9,33 +9,35 @@ import traceback
 from datetime import datetime
 
 # ============================================================
-# CONFIG (ENV VARIABLES)
+# DELTA XAUTUSD GRID BOT (ULTIMATE FINAL)
 # ============================================================
-# DELTA_API_KEY        = your api key
-# DELTA_API_SECRET     = your api secret
+# COMPLETE FEATURES (NOTHING MISSING):
 #
-# GRID                = 15      (default)
-# LOT_SIZE            = 1       (default)
-# SLEEP_SECONDS       = 5       (default)
-#
-# ENTRY_MULTIPLIER    = 10      (default)  -> when position becomes 0, first entry = LOT_SIZE * ENTRY_MULTIPLIER
-# MAX_REENTRY_SIZE    = 200     (default)  -> safety cap (maximum lots bot can buy in re-entry)
-#
-# IMPORTANT:
-# Bot will NEVER SHORT SELL (sell size always min(pos_size, LOT_SIZE or cycle_entry_size))
-# Manual trade sync is included.
+# ✅ Lock system (bot.lock)
+# ✅ State save/load (state.json)
+# ✅ Manual trade sync via fills
+# ✅ Restart recovery from fills
+# ✅ Position 0 -> Multiplier entry (LOT_SIZE * ENTRY_MULTIPLIER)
+# ✅ Down move -> grid buys (LOT_SIZE each GRID step)
+# ✅ Each buy has its own sell target (buy_price + GRID)
+# ✅ Sell triggers only that level qty at its sell_price
+# ✅ Multi-buy in same loop if price jumps down multiple levels
+# ✅ Multi-sell in same loop if price jumps up multiple levels
+# ✅ No short sell protection
+# ✅ Duplicate action guard
+# ✅ Partial buy fill supported
+# ✅ Partial sell fill supported
+# ✅ Multi-fill support (same order multiple fills summed)
+# ✅ Manual sell tolerance support (fills may not match exact sell_price)
 # ============================================================
 
 BASE_URL = "https://api.india.delta.exchange"
 
-# ============================================================
-# XAUTUSD SETTINGS
-# ============================================================
 SYMBOL = "XAUTUSD"
-PRODUCT_ID = 131253   # XAUTUSD product id confirmed by Delta Exchange
+PRODUCT_ID = 131253
 
 GRID = float(os.getenv("GRID", "15"))
-LOT_SIZE = float(os.getenv("LOT_SIZE", "1"))
+LOT_SIZE = float(os.getenv("LOT_SIZE", "5"))
 SLEEP_SECONDS = int(os.getenv("SLEEP_SECONDS", "5"))
 
 ENTRY_MULTIPLIER = float(os.getenv("ENTRY_MULTIPLIER", "10"))
@@ -47,7 +49,7 @@ API_SECRET = os.getenv("DELTA_API_SECRET")
 STATE_FILE = "state.json"
 LOCK_FILE = "bot.lock"
 
-USER_AGENT = "xautusd-grid-bot-ultra-stable-FINAL"
+USER_AGENT = "xautusd-grid-bot-ULTIMATE-FINAL"
 
 print("BOT FILE RUNNING...")
 sys.stdout.flush()
@@ -98,9 +100,8 @@ acquire_lock()
 
 def default_state():
     return {
-        "base_price": None,
-        "next_buy": None,
-        "next_sell": None,
+        "levels": [],
+        # {"buy_price": x, "sell_price": x+GRID, "size": size}
 
         "last_action": None,
         "last_action_price": None,
@@ -110,11 +111,8 @@ def default_state():
         "last_fill_price": None,
         "last_fill_side": None,
 
-        # NEW IMPORTANT:
-        # This stores current "cycle entry size"
-        # If position becomes 0, bot buys LOT_SIZE*ENTRY_MULTIPLIER
-        # and remembers that size until position becomes 0 again.
-        "cycle_entry_size": None
+        # for multi-fill tracking
+        "processed_fill_ids": []
     }
 
 
@@ -128,6 +126,17 @@ def load_state():
 
         d = default_state()
         d.update(data)
+
+        if d.get("levels") is None:
+            d["levels"] = []
+
+        if d.get("processed_fill_ids") is None:
+            d["processed_fill_ids"] = []
+
+        # safety cap processed list
+        if len(d["processed_fill_ids"]) > 2000:
+            d["processed_fill_ids"] = d["processed_fill_ids"][-1000:]
+
         return d
     except:
         return default_state()
@@ -248,40 +257,19 @@ def get_open_position_size():
     return 0.0
 
 
-def get_last_fill():
-    data = private_get("/v2/fills", params={"page_size": 50})
+def get_fills(page_size=100):
+    data = private_get("/v2/fills", params={"page_size": page_size})
 
     if data.get("success") is not True:
         raise Exception("Fills API failed: " + str(data))
 
-    fills = data.get("result", [])
-
-    for f in fills:
-        if f.get("product_symbol") == SYMBOL:
-            return f
-
-    return None
-
-
-def get_last_buy_fill_price():
-    data = private_get("/v2/fills", params={"page_size": 200})
-
-    if data.get("success") is not True:
-        raise Exception("Fills API failed: " + str(data))
-
-    fills = data.get("result", [])
-
-    for f in fills:
-        if f.get("product_symbol") == SYMBOL and f.get("side") == "buy":
-            return float(f.get("price"))
-
-    return None
+    return data.get("result", [])
 
 
 def place_market_order(side: str, size: float):
     payload = {
         "product_id": PRODUCT_ID,
-        "size": size,
+        "size": float(size),
         "side": side,
         "order_type": "market_order"
     }
@@ -290,27 +278,6 @@ def place_market_order(side: str, size: float):
     print("ORDER RESPONSE:", res)
     sys.stdout.flush()
     return res
-
-
-# ============================================================
-# GRID LEVELS
-# ============================================================
-
-def build_levels(base_price):
-    base_price = float(base_price)
-    return {
-        "base_price": base_price,
-        "next_buy": base_price - GRID,
-        "next_sell": base_price + GRID
-    }
-
-
-def update_levels_from_base(base_price):
-    levels = build_levels(base_price)
-    state["base_price"] = levels["base_price"]
-    state["next_buy"] = levels["next_buy"]
-    state["next_sell"] = levels["next_sell"]
-    save_state(state)
 
 
 # ============================================================
@@ -332,82 +299,251 @@ def mark_action(action, price, order_id=None):
 
 
 # ============================================================
-# MANUAL TRADE SYNC (IMPORTANT FIX)
+# LEVEL MANAGEMENT (PARTIAL SUPPORT)
 # ============================================================
 
-def sync_with_exchange_fills():
-    """
-    If manual buy/sell happened, bot will auto update base_price/levels
-    AND also adjust cycle_entry_size if needed.
-    """
-    last_fill = get_last_fill()
-    if last_fill is None:
+def sort_levels():
+    state["levels"] = sorted(state["levels"], key=lambda x: x["buy_price"])
+    save_state(state)
+
+
+def add_level(buy_price, size):
+    buy_price = float(buy_price)
+    size = float(size)
+
+    if size <= 0:
         return
 
-    fill_id = last_fill.get("id")
-    fill_price = float(last_fill.get("price"))
-    fill_side = last_fill.get("side")
+    level = {
+        "buy_price": buy_price,
+        "sell_price": buy_price + GRID,
+        "size": size
+    }
 
-    if fill_id is None:
-        return
+    state["levels"].append(level)
+    sort_levels()
 
-    if state.get("last_fill_id") != fill_id:
-        print("NEW EXCHANGE FILL DETECTED -> SYNCING GRID LEVELS...")
-        print("FILL SIDE:", fill_side, "PRICE:", fill_price, "ID:", fill_id)
-        sys.stdout.flush()
 
-        update_levels_from_base(fill_price)
+def reduce_level_by_sell_price(sell_price, sold_size):
+    sell_price = float(sell_price)
+    sold_size = float(sold_size)
 
-        state["last_fill_id"] = fill_id
-        state["last_fill_price"] = fill_price
-        state["last_fill_side"] = fill_side
+    for i, lv in enumerate(state["levels"]):
+        if abs(float(lv["sell_price"]) - sell_price) < 0.05:
+            current_size = float(lv["size"])
 
-        # reset duplicate guard
-        state["last_action"] = None
-        state["last_action_price"] = None
+            if sold_size >= current_size:
+                removed = state["levels"].pop(i)
+                save_state(state)
+                return removed
+            else:
+                state["levels"][i]["size"] = current_size - sold_size
+                save_state(state)
+                return state["levels"][i]
 
-        # NEW: if manual trade caused position to become 0,
-        # reset cycle_entry_size so next entry becomes multiplier entry again.
-        pos_size = get_open_position_size()
-        if pos_size <= 0:
-            print("MANUAL TRADE MADE POSITION 0 -> RESETTING CYCLE ENTRY SIZE")
-            state["cycle_entry_size"] = None
+    return None
 
+
+def reduce_closest_sell_level(fill_price, sold_size):
+    """
+    Manual sell tolerance:
+    if fill price doesn't match exact sell_price,
+    find closest sell_price within tolerance.
+    """
+    if not state["levels"]:
+        return None
+
+    fill_price = float(fill_price)
+    sold_size = float(sold_size)
+
+    closest = None
+    closest_index = None
+    closest_diff = 999999
+
+    for i, lv in enumerate(state["levels"]):
+        diff = abs(float(lv["sell_price"]) - fill_price)
+        if diff < closest_diff:
+            closest_diff = diff
+            closest = lv
+            closest_index = i
+
+    # tolerance: must be within 2 points
+    if closest is None or closest_diff > 2.0:
+        return None
+
+    current_size = float(closest["size"])
+
+    if sold_size >= current_size:
+        removed = state["levels"].pop(closest_index)
         save_state(state)
+        return removed
+    else:
+        state["levels"][closest_index]["size"] = current_size - sold_size
+        save_state(state)
+        return state["levels"][closest_index]
 
-        print("GRID UPDATED FROM MANUAL FILL:", state)
-        sys.stdout.flush()
+
+def get_next_buy_price():
+    if not state["levels"]:
+        return None
+
+    lowest_buy = min([lv["buy_price"] for lv in state["levels"]])
+    return float(lowest_buy - GRID)
+
+
+def get_next_sell_target(price):
+    sell_candidates = []
+    for lv in state["levels"]:
+        if float(price) >= float(lv["sell_price"]):
+            sell_candidates.append(lv)
+
+    if not sell_candidates:
+        return None
+
+    sell_candidates = sorted(sell_candidates, key=lambda x: x["sell_price"])
+    return sell_candidates[0]
+
+
+def reset_all_levels():
+    state["levels"] = []
+    save_state(state)
 
 
 # ============================================================
-# RE-ENTRY MULTIPLIER SYSTEM
+# MULTIPLIER ENTRY SYSTEM
 # ============================================================
 
 def calculate_reentry_size():
-    """
-    Returns the re-entry buy size when position becomes 0.
-    Uses LOT_SIZE * ENTRY_MULTIPLIER but capped by MAX_REENTRY_SIZE.
-    """
     size = LOT_SIZE * ENTRY_MULTIPLIER
     if size > MAX_REENTRY_SIZE:
         size = MAX_REENTRY_SIZE
     return float(size)
 
 
-def ensure_cycle_entry_size_initialized():
+# ============================================================
+# PROCESS NEW FILLS (MULTI-FILL SAFE)
+# ============================================================
+
+def process_new_fills():
     """
-    If cycle_entry_size is missing, set it now.
-    This happens only when position becomes 0.
+    Reads recent fills and applies those not processed yet.
+    Supports multiple fills from same order.
     """
-    if state.get("cycle_entry_size") is None:
-        state["cycle_entry_size"] = calculate_reentry_size()
-        save_state(state)
-        print("NEW CYCLE ENTRY SIZE SET:", state["cycle_entry_size"])
+    fills = get_fills(page_size=200)
+
+    new_fills = []
+    for f in fills:
+        if f.get("product_symbol") != SYMBOL:
+            continue
+        fid = f.get("id")
+        if fid is None:
+            continue
+        if fid in state["processed_fill_ids"]:
+            continue
+        new_fills.append(f)
+
+    if not new_fills:
+        return
+
+    # process oldest first
+    new_fills = sorted(new_fills, key=lambda x: x.get("created_at", ""))
+
+    for f in new_fills:
+        fid = f.get("id")
+        fill_price = float(f.get("price"))
+        fill_side = f.get("side")
+        fill_size = float(f.get("size", 0))
+
+        if fill_size <= 0:
+            state["processed_fill_ids"].append(fid)
+            continue
+
+        print("PROCESSING NEW FILL:", fill_side, fill_price, fill_size, "ID:", fid)
         sys.stdout.flush()
+
+        if fill_side == "buy":
+            add_level(fill_price, fill_size)
+
+        elif fill_side == "sell":
+            removed = reduce_level_by_sell_price(fill_price, fill_size)
+            if removed is None:
+                reduce_closest_sell_level(fill_price, fill_size)
+
+        state["last_fill_id"] = fid
+        state["last_fill_price"] = fill_price
+        state["last_fill_side"] = fill_side
+
+        state["processed_fill_ids"].append(fid)
+
+    # cap processed list
+    if len(state["processed_fill_ids"]) > 2000:
+        state["processed_fill_ids"] = state["processed_fill_ids"][-1000:]
+
+    save_state(state)
+
+    # if position is 0 reset everything
+    pos_size = get_open_position_size()
+    if pos_size <= 0:
+        reset_all_levels()
 
 
 # ============================================================
-# STARTUP RECOVERY
+# STARTUP RECOVERY (REBUILD LEVELS FROM FILLS)
+# ============================================================
+
+def rebuild_levels_from_fills():
+    """
+    Rebuild grid levels by replaying fills history.
+    This is best recovery method.
+    """
+    print("REBUILDING LEVELS FROM FILLS HISTORY...")
+    sys.stdout.flush()
+
+    reset_all_levels()
+    state["processed_fill_ids"] = []
+    save_state(state)
+
+    fills = get_fills(page_size=200)
+
+    # take only symbol fills
+    symbol_fills = [f for f in fills if f.get("product_symbol") == SYMBOL]
+
+    # oldest first
+    symbol_fills = sorted(symbol_fills, key=lambda x: x.get("created_at", ""))
+
+    for f in symbol_fills:
+        fid = f.get("id")
+        if fid is None:
+            continue
+
+        fill_price = float(f.get("price"))
+        fill_side = f.get("side")
+        fill_size = float(f.get("size", 0))
+
+        if fill_size <= 0:
+            continue
+
+        if fill_side == "buy":
+            add_level(fill_price, fill_size)
+
+        elif fill_side == "sell":
+            removed = reduce_level_by_sell_price(fill_price, fill_size)
+            if removed is None:
+                reduce_closest_sell_level(fill_price, fill_size)
+
+        state["processed_fill_ids"].append(fid)
+
+    if len(state["processed_fill_ids"]) > 2000:
+        state["processed_fill_ids"] = state["processed_fill_ids"][-1000:]
+
+    save_state(state)
+
+    print("REBUILD DONE. LEVELS:", state["levels"])
+    sys.stdout.flush()
+
+
+# ============================================================
+# STARTUP
 # ============================================================
 
 print("STATE LOADED:", state)
@@ -421,31 +557,13 @@ try:
     print("STARTUP POS SIZE:", pos_size)
     sys.stdout.flush()
 
-    # If no position -> reset state
+    # if open position exists but state empty -> rebuild from fills
+    if pos_size > 0 and not state["levels"]:
+        rebuild_levels_from_fills()
+
+    # if no position -> reset state
     if pos_size <= 0:
-        state = default_state()
-        save_state(state)
-        print("NO POSITION FOUND -> STATE RESET")
-        sys.stdout.flush()
-
-    # If position exists but grid missing -> recover from exchange buy fill
-    if pos_size > 0 and (state["base_price"] is None or state["next_buy"] is None or state["next_sell"] is None):
-        exchange_last_buy = get_last_buy_fill_price()
-        print("EXCHANGE LAST BUY FILL:", exchange_last_buy)
-        sys.stdout.flush()
-
-        if exchange_last_buy is not None:
-            update_levels_from_base(exchange_last_buy)
-            print("RECOVERED LEVELS FROM EXCHANGE:", state)
-            sys.stdout.flush()
-
-    # If position exists and cycle_entry_size missing -> set to LOT_SIZE (normal)
-    # Because this is already running cycle.
-    if pos_size > 0 and state.get("cycle_entry_size") is None:
-        state["cycle_entry_size"] = LOT_SIZE
-        save_state(state)
-        print("CYCLE ENTRY SIZE SET TO NORMAL LOT_SIZE (already in position).")
-        sys.stdout.flush()
+        reset_all_levels()
 
 except Exception as e:
     print("STARTUP ERROR:", str(e))
@@ -460,164 +578,111 @@ except Exception as e:
 try:
     while True:
         try:
-            # Reload env live
-            LOT_SIZE = float(os.getenv("LOT_SIZE", "1"))
+            LOT_SIZE = float(os.getenv("LOT_SIZE", "5"))
             GRID = float(os.getenv("GRID", "15"))
             ENTRY_MULTIPLIER = float(os.getenv("ENTRY_MULTIPLIER", "10"))
             MAX_REENTRY_SIZE = float(os.getenv("MAX_REENTRY_SIZE", "200"))
 
-            # Sync manual trades every loop
-            sync_with_exchange_fills()
+            # process new fills (manual + bot trades + partial fills)
+            process_new_fills()
 
             price = get_live_price()
             pos_size = get_open_position_size()
 
             now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-            print(f"{now} LIVE PRICE: {price} | POS: {pos_size} | NEXT_BUY: {state.get('next_buy')} | NEXT_SELL: {state.get('next_sell')} | LOT_SIZE: {LOT_SIZE} | CYCLE_ENTRY_SIZE: {state.get('cycle_entry_size')}")
+            print(f"{now} PRICE:{price} POS:{pos_size} NEXT_BUY:{get_next_buy_price()} LEVELS:{state.get('levels')}")
             sys.stdout.flush()
 
             # ============================================================
-            # IF POSITION 0 -> MULTIPLIER BUY ENTRY
+            # POSITION 0 -> MULTIPLIER ENTRY
             # ============================================================
             if pos_size <= 0:
-                print("POSITION IS 0 -> RE-ENTRY MULTIPLIER BUY TRIGGERED")
+                print("POSITION 0 -> MULTIPLIER BUY ENTRY")
                 sys.stdout.flush()
 
-                ensure_cycle_entry_size_initialized()
-                entry_size = float(state["cycle_entry_size"])
-
-                # Safety cap
-                if entry_size > MAX_REENTRY_SIZE:
-                    entry_size = MAX_REENTRY_SIZE
-
-                if entry_size <= 0:
-                    print("ENTRY SIZE INVALID -> SKIPPING")
-                    sys.stdout.flush()
-                    time.sleep(SLEEP_SECONDS)
-                    continue
+                entry_size = calculate_reentry_size()
 
                 resp = place_market_order("buy", entry_size)
 
                 if resp.get("success") is True:
                     order_id = resp.get("result", {}).get("id")
+                    mark_action("buy", price, order_id)
 
+                    # after placing order, wait and sync fills
                     time.sleep(1)
-                    fill = get_last_buy_fill_price()
-                    if fill is None:
-                        fill = price
-
-                    update_levels_from_base(fill)
-                    mark_action("buy", fill, order_id)
-
-                    print("RE-ENTRY BUY DONE -> GRID STARTED FROM:", fill)
-                    sys.stdout.flush()
+                    process_new_fills()
 
                 time.sleep(SLEEP_SECONDS)
                 continue
 
             # ============================================================
-            # IF LEVELS MISSING -> RECOVER
+            # MULTI BUY LOOP (PRICE JUMP DOWN)
             # ============================================================
-            if state["base_price"] is None or state["next_buy"] is None or state["next_sell"] is None:
-                exchange_last_buy = get_last_buy_fill_price()
-                if exchange_last_buy is not None:
-                    update_levels_from_base(exchange_last_buy)
-                    print("LEVELS RECOVERED DURING RUN:", state)
-                    sys.stdout.flush()
+            while True:
+                next_buy = get_next_buy_price()
+                if next_buy is None:
+                    break
 
-                time.sleep(SLEEP_SECONDS)
-                continue
-
-            next_buy = float(state["next_buy"])
-            next_sell = float(state["next_sell"])
-
-            # ============================================================
-            # GRID BUY (NORMAL LOT_SIZE ONLY)
-            # ============================================================
-            if price <= next_buy:
+                if price > next_buy:
+                    break
 
                 if already_executed_same_price("buy", next_buy):
-                    print("SKIPPING DUPLICATE BUY AT SAME GRID LEVEL.")
-                    sys.stdout.flush()
-                    time.sleep(SLEEP_SECONDS)
-                    continue
+                    break
 
-                print("GRID BUY TRIGGERED...")
+                print("GRID BUY TRIGGERED AT:", next_buy)
                 sys.stdout.flush()
 
                 resp = place_market_order("buy", LOT_SIZE)
 
                 if resp.get("success") is True:
                     order_id = resp.get("result", {}).get("id")
-
-                    time.sleep(1)
-                    fill = get_last_buy_fill_price()
-                    if fill is None:
-                        fill = price
-
-                    update_levels_from_base(fill)
                     mark_action("buy", next_buy, order_id)
 
-                    print("BUY CONFIRMED -> UPDATED LEVELS:", state)
-                    sys.stdout.flush()
+                    time.sleep(1)
+                    process_new_fills()
+
+                    pos_size = get_open_position_size()
+                else:
+                    break
 
             # ============================================================
-            # GRID SELL (SELL MUST MATCH CURRENT CYCLE ENTRY LOGIC)
+            # MULTI SELL LOOP (PRICE JUMP UP)
             # ============================================================
-            elif price >= next_sell:
+            while True:
+                sell_level = get_next_sell_target(price)
+                if sell_level is None:
+                    break
 
-                if already_executed_same_price("sell", next_sell):
-                    print("SKIPPING DUPLICATE SELL AT SAME GRID LEVEL.")
-                    sys.stdout.flush()
-                    time.sleep(SLEEP_SECONDS)
-                    continue
+                sell_price = float(sell_level["sell_price"])
+                sell_size = float(sell_level["size"])
 
-                # Determine sell size:
-                # If cycle_entry_size exists, we try to close that same size in grid sell.
-                cycle_entry_size = state.get("cycle_entry_size")
-                if cycle_entry_size is None:
-                    cycle_entry_size = LOT_SIZE
+                if already_executed_same_price("sell", sell_price):
+                    break
 
-                desired_sell = min(float(cycle_entry_size), LOT_SIZE)
-
-                # IMPORTANT:
-                # If cycle_entry_size is bigger than LOT_SIZE (example 50),
-                # then selling should also be that full 50 when grid sell hits.
-                # So we override desired_sell:
-                if float(cycle_entry_size) > LOT_SIZE:
-                    desired_sell = float(cycle_entry_size)
-
-                # STRICT NO SHORT SELL PROTECTION
-                sell_size = min(desired_sell, pos_size)
+                sell_size = min(sell_size, pos_size)
 
                 if sell_size <= 0:
-                    print("SELL BLOCKED -> POSITION 0 (NO SHORT ALLOWED).")
-                    sys.stdout.flush()
-                    time.sleep(SLEEP_SECONDS)
-                    continue
+                    break
 
-                print("GRID SELL TRIGGERED... SELL_SIZE:", sell_size)
+                print("GRID SELL TRIGGERED AT:", sell_price, "SELL SIZE:", sell_size)
                 sys.stdout.flush()
 
                 resp = place_market_order("sell", sell_size)
 
                 if resp.get("success") is True:
                     order_id = resp.get("result", {}).get("id")
+                    mark_action("sell", sell_price, order_id)
 
-                    update_levels_from_base(price)
-                    mark_action("sell", next_sell, order_id)
-
-                    print("SELL CONFIRMED -> UPDATED LEVELS:", state)
-                    sys.stdout.flush()
-
-                    # If after selling, position becomes 0 -> reset cycle_entry_size
                     time.sleep(1)
-                    new_pos = get_open_position_size()
-                    if new_pos <= 0:
-                        print("POSITION BECAME 0 AFTER SELL -> RESETTING CYCLE ENTRY SIZE (NEXT BUY WILL BE MULTIPLIER)")
-                        state["cycle_entry_size"] = None
-                        save_state(state)
+                    process_new_fills()
+
+                    pos_size = get_open_position_size()
+
+                    if pos_size <= 0:
+                        reset_all_levels()
+                        break
+                else:
+                    break
 
         except Exception as e:
             print("RUNTIME ERROR:", str(e))
