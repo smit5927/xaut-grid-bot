@@ -42,6 +42,8 @@ from datetime import datetime
 # ✅ Mismatch protection (pos vs levels sum)
 # ✅ SERIES STEP SYSTEM (100 points dynamic lot add/subtract)
 # ✅ FIXED FRACTIONAL LEVELS BUG (NO PROPORTIONAL SCALING)
+# ✅ FIXED MANUAL BUY FILL SPLIT INSIDE process_new_fills()
+# ✅ FIXED REBUILD CYCLE FLAG RESTORE
 # ============================================================
 
 BASE_URL = "https://api.india.delta.exchange"
@@ -173,6 +175,16 @@ def load_state():
 
         if d.get("processed_fill_ids") is None:
             d["processed_fill_ids"] = []
+
+        # FIX: remove duplicates safely
+        unique_ids = []
+        seen = set()
+        for x in d["processed_fill_ids"]:
+            if x not in seen:
+                unique_ids.append(x)
+                seen.add(x)
+
+        d["processed_fill_ids"] = unique_ids
 
         if len(d["processed_fill_ids"]) > 5000:
             d["processed_fill_ids"] = d["processed_fill_ids"][-2000:]
@@ -647,10 +659,28 @@ def process_new_fills():
         print("PROCESSING NEW FILL:", fill_side, fill_price, fill_size, "ID:", fid)
         sys.stdout.flush()
 
+        # ============================================================
+        # FIX: MANUAL BUY SPLIT LOGIC INSIDE FILL PROCESSING
+        # ============================================================
         if fill_side == "buy":
-            # normal buy fill adds level
-            # NOTE: cycle buy is handled separately only on pos==0 reentry
-            add_level(fill_price, fill_size, is_cycle=False)
+            cycle_target = get_cycle_target_size()
+            current_cycle = get_current_cycle_size()
+            cycle_missing = max(0.0, cycle_target - current_cycle)
+
+            if cycle_missing > 0:
+                cycle_add = min(fill_size, cycle_missing)
+                if cycle_add > 0:
+                    print("FILL BUY -> SPLIT: ADDING CYCLE:", cycle_add)
+                    sys.stdout.flush()
+                    add_level(fill_price, cycle_add, is_cycle=True)
+
+                remaining = fill_size - cycle_add
+                if remaining > 0:
+                    print("FILL BUY -> SPLIT: ADDING NORMAL:", remaining)
+                    sys.stdout.flush()
+                    add_level(fill_price, remaining, is_cycle=False)
+            else:
+                add_level(fill_price, fill_size, is_cycle=False)
 
         elif fill_side == "sell":
             removed = reduce_exact_sell_level(fill_price, fill_size)
@@ -772,6 +802,44 @@ def rebuild_levels_from_fills(pos_size):
                     break
 
             open_levels = sorted(open_levels, key=lambda x: float(x["buy_price"]))
+
+    # ============================================================
+    # FIX: RESTORE CYCLE FLAG AFTER REBUILD
+    # Cycle is always first target size (LOT_SIZE*ENTRY_MULTIPLIER)
+    # ============================================================
+    cycle_target = get_cycle_target_size()
+    cycle_remaining = cycle_target
+
+    for lv in open_levels:
+        if cycle_remaining <= 0:
+            break
+
+        lv_size = float(lv["size"])
+        if lv_size <= 0:
+            continue
+
+        if lv_size <= cycle_remaining + 0.00001:
+            lv["is_cycle"] = True
+            cycle_remaining -= lv_size
+        else:
+            # split level if needed
+            cycle_part = cycle_remaining
+            normal_part = lv_size - cycle_part
+
+            lv["size"] = cycle_part
+            lv["is_cycle"] = True
+
+            open_levels.append({
+                "buy_price": lv["buy_price"],
+                "sell_price": lv["sell_price"],
+                "size": normal_part,
+                "is_cycle": False
+            })
+
+            cycle_remaining = 0
+            break
+
+    open_levels = sorted(open_levels, key=lambda x: float(x["buy_price"]))
 
     state["levels"] = []
     for lv in open_levels:
