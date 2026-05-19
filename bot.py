@@ -10,13 +10,17 @@ import math
 from datetime import datetime
 
 # ============================================================
-# DELTA XAUTUSD GRID BOT (FULL FINAL FIX)
+# DELTA XAUTUSD GRID BOT (FULL FINAL FIX - NO LOGIC MISSING)
 # ============================================================
 # INCLUDED (NOTHING MISSING):
 #
 # ✅ Lock system (bot.lock)
 # ✅ State save/load (state.json)
 # ✅ Manual trade sync (fills)
+# ✅ Manual BUY split logic:
+#       Example: manual 75 buy => 50 cycle + 25 normal
+#       manual 120 buy => 50 cycle + 70 normal
+#       manual 30 buy => 30 normal
 # ✅ Restart safe recovery (REBUILD from fills history)
 # ✅ Position 0 -> Multiplier entry (LOT_SIZE * ENTRY_MULTIPLIER)
 # ✅ cycle_entry_size logic preserved
@@ -37,6 +41,7 @@ from datetime import datetime
 # ✅ FULL RECOVERY from fills history (old bot open positions safe)
 # ✅ Mismatch protection (pos vs levels sum)
 # ✅ SERIES STEP SYSTEM (100 points dynamic lot add/subtract)
+# ✅ FIXED FRACTIONAL LEVELS BUG (NO PROPORTIONAL SCALING)
 # ============================================================
 
 BASE_URL = "https://api.india.delta.exchange"
@@ -68,7 +73,7 @@ API_SECRET = os.getenv("DELTA_API_SECRET")
 STATE_FILE = "state.json"
 LOCK_FILE = "bot.lock"
 
-USER_AGENT = "xautusd-grid-bot-FULL-FINAL-NO-SHORT"
+USER_AGENT = "xautusd-grid-bot-FULL-FINAL-NO-SHORT-MANUALSAFE"
 
 print("BOT FILE RUNNING...")
 sys.stdout.flush()
@@ -348,7 +353,6 @@ def mark_action(action, price, order_id=None):
 # ============================================================
 
 def get_series_floor(price):
-    # series floor = nearest lower multiple of SERIES_STEP
     if SERIES_STEP <= 0:
         return None
     return math.floor(float(price) / SERIES_STEP) * SERIES_STEP
@@ -362,7 +366,6 @@ def calculate_dynamic_lot(current_series, base_series):
         return float(LOT_SIZE)
 
     diff_steps = int(round((float(base_series) - float(current_series)) / SERIES_STEP))
-    # if price is above base_series, diff_steps negative -> lot decreases, but never below LOT_SIZE
     dynamic = float(LOT_SIZE) + float(diff_steps) * float(SERIES_ADD_LOT)
 
     if dynamic < LOT_SIZE:
@@ -513,7 +516,98 @@ def mark_reentry_time():
 
 
 # ============================================================
-# PROCESS NEW FILLS (FIXED DUPLICATE BUG)
+# MANUAL TRADE SAFE SYNC HELPERS
+# ============================================================
+
+def get_cycle_target_size():
+    return float(calculate_reentry_size())
+
+
+def get_current_cycle_size():
+    total = 0.0
+    for lv in state["levels"]:
+        if lv.get("is_cycle") is True:
+            total += float(lv.get("size", 0))
+    return float(total)
+
+
+def manual_trade_position_sync(pos_size, price):
+    """
+    If user does manual buy/sell, levels sum mismatch occurs.
+    We fix it WITHOUT breaking original logic.
+
+    Rule:
+    - If pos_size > levels_sum => missing is manual buy
+      -> first fill cycle if cycle missing, then remaining as normal
+    - If pos_size < levels_sum => extra is manual sell
+      -> reduce levels starting from highest buy (safest)
+    """
+
+    pos_size = float(pos_size)
+    price = float(price)
+
+    total_levels = get_total_level_size()
+    diff = pos_size - total_levels
+
+    if abs(diff) < 0.01:
+        return
+
+    # Manual BUY happened
+    if diff > 0:
+        missing = diff
+
+        cycle_target = get_cycle_target_size()
+        current_cycle = get_current_cycle_size()
+
+        # First try to fill cycle level if not complete
+        cycle_missing = max(0.0, cycle_target - current_cycle)
+
+        if cycle_missing > 0:
+            cycle_add = min(missing, cycle_missing)
+            if cycle_add > 0:
+                print("MANUAL SYNC: ADDING CYCLE LEVEL:", cycle_add, "AT PRICE:", price)
+                sys.stdout.flush()
+                add_level(price, cycle_add, is_cycle=True)
+                missing -= cycle_add
+
+        # Remaining becomes normal grid levels
+        if missing > 0:
+            print("MANUAL SYNC: ADDING NORMAL LEVEL:", missing, "AT PRICE:", price)
+            sys.stdout.flush()
+            add_level(price, missing, is_cycle=False)
+
+        return
+
+    # Manual SELL happened
+    if diff < 0:
+        extra = abs(diff)
+
+        print("MANUAL SYNC: DETECTED MANUAL SELL, NEED REMOVE SIZE:", extra)
+        sys.stdout.flush()
+
+        # remove from highest buy first
+        state["levels"] = sorted(state["levels"], key=lambda x: float(x["buy_price"]), reverse=True)
+
+        i = 0
+        while i < len(state["levels"]) and extra > 0:
+            lv = state["levels"][i]
+            lv_size = float(lv.get("size", 0))
+
+            if extra >= lv_size - 0.00001:
+                extra -= lv_size
+                state["levels"].pop(i)
+                continue
+            else:
+                lv["size"] = lv_size - extra
+                extra = 0
+                break
+
+        sort_levels()
+        return
+
+
+# ============================================================
+# PROCESS NEW FILLS (FIXED DUPLICATE BUG + PARTIAL SUPPORT)
 # ============================================================
 
 def process_new_fills():
@@ -533,7 +627,6 @@ def process_new_fills():
         if fid in processed_fill_set:
             continue
 
-        # mark immediately in set (IMPORTANT FIX)
         processed_fill_set.add(fid)
         new_fills.append(f)
 
@@ -555,6 +648,8 @@ def process_new_fills():
         sys.stdout.flush()
 
         if fill_side == "buy":
+            # normal buy fill adds level
+            # NOTE: cycle buy is handled separately only on pos==0 reentry
             add_level(fill_price, fill_size, is_cycle=False)
 
         elif fill_side == "sell":
@@ -573,7 +668,6 @@ def process_new_fills():
 
     save_state()
 
-    # if exchange says position 0 -> reset everything
     pos_size = get_open_position_size()
     if pos_size == 0:
         reset_all_levels()
@@ -588,6 +682,9 @@ def rebuild_levels_from_fills(pos_size):
     Rebuilds open levels by scanning fills history.
     Matches sells against buys using sell targets (buy+GRID).
     Not FIFO, but by target matching (your required logic).
+
+    FIXED: No proportional scaling (fractional bug removed).
+    Instead we trim open_levels to match pos_size.
     """
 
     print("REBUILDING LEVELS FROM FILLS HISTORY...")
@@ -599,7 +696,6 @@ def rebuild_levels_from_fills(pos_size):
     fills = [f for f in fills if f.get("product_symbol") == SYMBOL]
     fills = sorted(fills, key=lambda x: x.get("created_at", ""))
 
-    # temporary open map: list of open lots
     open_levels = []
 
     for f in fills:
@@ -621,15 +717,15 @@ def rebuild_levels_from_fills(pos_size):
         elif side == "sell":
             remaining_sell = size
 
-            # match sells by closest sell_price first (your logic)
             open_levels = sorted(open_levels, key=lambda x: abs(float(x["sell_price"]) - price))
 
             i = 0
             while i < len(open_levels) and remaining_sell > 0:
                 lv = open_levels[i]
-                # allow match only if sell price is close enough
+
                 if abs(float(lv["sell_price"]) - price) <= 5.0:
                     lv_size = float(lv["size"])
+
                     if remaining_sell >= lv_size - 0.00001:
                         remaining_sell -= lv_size
                         open_levels.pop(i)
@@ -638,10 +734,9 @@ def rebuild_levels_from_fills(pos_size):
                         lv["size"] = lv_size - remaining_sell
                         remaining_sell = 0
                         break
+
                 i += 1
 
-    # Now open_levels represent remaining buys not sold
-    # But they may exceed current pos_size due to old history, so trim safely.
     open_levels = sorted(open_levels, key=lambda x: float(x["buy_price"]))
 
     total = sum([float(x["size"]) for x in open_levels])
@@ -650,14 +745,34 @@ def rebuild_levels_from_fills(pos_size):
         reset_all_levels()
         return
 
-    # Normalize if mismatch with exchange pos
+    # FIX: NO FRACTIONAL SCALING
+    # Instead trim from highest buy until total == pos_size
     if abs(total - pos_size) > 0.01:
-        # scale down proportionally (safe approach)
-        ratio = pos_size / total
-        for lv in open_levels:
-            lv["size"] = float(lv["size"]) * ratio
+        print("REBUILD MISMATCH -> TRIMMING LEVELS")
+        print("LEVEL TOTAL:", total, "EXCHANGE POS:", pos_size)
+        sys.stdout.flush()
 
-    # save into state
+        if total > pos_size:
+            extra = total - pos_size
+
+            open_levels = sorted(open_levels, key=lambda x: float(x["buy_price"]), reverse=True)
+
+            i = 0
+            while i < len(open_levels) and extra > 0:
+                lv = open_levels[i]
+                lv_size = float(lv["size"])
+
+                if extra >= lv_size - 0.00001:
+                    extra -= lv_size
+                    open_levels.pop(i)
+                    continue
+                else:
+                    lv["size"] = lv_size - extra
+                    extra = 0
+                    break
+
+            open_levels = sorted(open_levels, key=lambda x: float(x["buy_price"]))
+
     state["levels"] = []
     for lv in open_levels:
         if float(lv["size"]) > 0.00001:
@@ -670,7 +785,7 @@ def rebuild_levels_from_fills(pos_size):
 
 
 # ============================================================
-# MISMATCH PROTECTION
+# MISMATCH PROTECTION + MANUAL TRADE SAFE MODE
 # ============================================================
 
 def mismatch_protection_check():
@@ -680,7 +795,6 @@ def mismatch_protection_check():
         reset_all_levels()
         return
 
-    # NEGATIVE POS SAFETY (IMPORTANT FIX)
     if pos_size < 0:
         print("WARNING: NEGATIVE POSITION DETECTED:", pos_size)
         print("WAITING FOR DELTA SYNC...")
@@ -695,12 +809,26 @@ def mismatch_protection_check():
         rebuild_levels_from_fills(pos_size)
         return
 
-    if abs(total_levels - pos_size) > 0.5:
-        print("POSITION MISMATCH DETECTED !!!")
+    # MANUAL TRADE SAFE MODE (MAIN FIX)
+    if abs(total_levels - pos_size) > 0.01:
+        try:
+            live_price = get_live_price()
+        except:
+            live_price = state.get("last_fill_price") or 0
+
+        print("MISMATCH DETECTED -> TRYING MANUAL TRADE SYNC")
         print("EXCHANGE POS:", pos_size, "STATE LEVEL SUM:", total_levels)
-        print("FULL RECOVERY FROM FILLS NOW...")
         sys.stdout.flush()
-        rebuild_levels_from_fills(pos_size)
+
+        manual_trade_position_sync(pos_size, live_price)
+
+        # re-check after sync
+        total_levels2 = get_total_level_size()
+
+        if abs(total_levels2 - pos_size) > 0.5:
+            print("MANUAL SYNC FAILED -> FULL RECOVERY FROM FILLS")
+            sys.stdout.flush()
+            rebuild_levels_from_fills(pos_size)
 
 
 # ============================================================
@@ -718,7 +846,6 @@ try:
     print("STARTUP POS SIZE:", pos_size)
     sys.stdout.flush()
 
-    # series base set only if empty
     if state.get("cycle_base_series") is None and pos_size > 0:
         state["cycle_base_series"] = get_series_floor(price)
         save_state()
@@ -751,7 +878,6 @@ try:
             price = get_live_price()
             pos_size = get_open_position_size()
 
-            # negative position safety
             if pos_size < 0:
                 print("NEGATIVE POS STILL:", pos_size, "WAITING...")
                 sys.stdout.flush()
@@ -785,9 +911,7 @@ try:
 
                 entry_size = calculate_reentry_size()
 
-                # update base series for new cycle
                 state["cycle_base_series"] = get_series_floor(price)
-
                 mark_reentry_time()
 
                 resp = place_market_order("buy", entry_size)
@@ -795,6 +919,9 @@ try:
                 if resp.get("success") is True:
                     order_id = resp.get("result", {}).get("id")
                     mark_action("buy", price, order_id)
+
+                    # IMPORTANT: cycle level stored manually
+                    add_level(price, entry_size, is_cycle=True)
 
                     time.sleep(1)
                     process_new_fills()
@@ -816,7 +943,6 @@ try:
                 if already_executed_same_price("buy", next_buy):
                     break
 
-                # dynamic lot recalculated based on current price series
                 current_series = get_series_floor(price)
                 dynamic_lot = calculate_dynamic_lot(current_series, state.get("cycle_base_series"))
 
@@ -838,6 +964,9 @@ try:
                 else:
                     break
 
+                # refresh live price for jump down multi loop
+                price = get_live_price()
+
             # ============================================================
             # MULTI SELL LOOP (PRICE JUMP UP)
             # ============================================================
@@ -852,7 +981,6 @@ try:
                 if already_executed_same_price("sell", sell_price):
                     break
 
-                # HARD NO SHORT SELL PROTECTION
                 pos_size = get_open_position_size()
                 if pos_size <= 0:
                     print("SELL BLOCKED -> POS <= 0 (NO SHORT ALLOWED)")
@@ -888,6 +1016,9 @@ try:
                         break
                 else:
                     break
+
+                # refresh live price for jump up multi loop
+                price = get_live_price()
 
         except Exception as e:
             print("RUNTIME ERROR:", str(e))
