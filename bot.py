@@ -6,33 +6,12 @@ import hmac
 import hashlib
 import requests
 import traceback
+import math
 from datetime import datetime
 
 # ============================================================
-# DELTA XAUTUSD GRID BOT (FINAL + POSITION MISMATCH FIX)
-# ============================================================
-# INCLUDED (NOTHING MISSING):
-#
-# ✅ Lock system (bot.lock)
-# ✅ State save/load (state.json)
-# ✅ Manual trade sync (fills)
-# ✅ Restart safe recovery (NO wrong rebuild)
-# ✅ Position 0 -> Multiplier entry (LOT_SIZE * ENTRY_MULTIPLIER)
-# ✅ cycle_entry_size logic (original code preserved)
-# ✅ Downside -> grid buys (LOT_SIZE each GRID step)
-# ✅ Every buy creates its own sell target (buy_price + GRID)
-# ✅ Cycle batch (50 lot) sells only at its own sell target
-# ✅ Small 5-5 lots sell at their own target
-# ✅ Multi-buy in same loop if price jumps down multiple grids
-# ✅ Multi-sell in same loop if price jumps up multiple grids
-# ✅ No short sell protection
-# ✅ Duplicate action guard
-# ✅ Partial BUY fill supported
-# ✅ Partial SELL fill supported
-# ✅ Multi-fill supported (fills processed individually)
-# ✅ Manual sell tolerance fix
-# ✅ FIXED LIVE ISSUE: No wrong rebuild from old fills
-# ✅ NEW PROTECTION: if pos_size != sum(level sizes) -> auto recover
+# DELTA XAUTUSD GRID BOT (FINAL ULTIMATE)
+# SERIES BASED LOT ADDER + MULTIPLIER CYCLE + PARTIAL FILL SAFE
 # ============================================================
 
 BASE_URL = "https://api.india.delta.exchange"
@@ -47,13 +26,17 @@ SLEEP_SECONDS = int(os.getenv("SLEEP_SECONDS", "5"))
 ENTRY_MULTIPLIER = float(os.getenv("ENTRY_MULTIPLIER", "10"))
 MAX_REENTRY_SIZE = float(os.getenv("MAX_REENTRY_SIZE", "200"))
 
+# NEW SERIES CONFIG
+SERIES_STEP = float(os.getenv("SERIES_STEP", "100"))
+SERIES_ADD_LOT = float(os.getenv("SERIES_ADD_LOT", "0"))
+
 API_KEY = os.getenv("DELTA_API_KEY")
 API_SECRET = os.getenv("DELTA_API_SECRET")
 
 STATE_FILE = "state.json"
 LOCK_FILE = "bot.lock"
 
-USER_AGENT = "xautusd-grid-bot-FINAL-MISMATCH-PROTECT"
+USER_AGENT = "xautusd-grid-bot-FINAL-ULTIMATE-SERIES"
 
 print("BOT FILE RUNNING...")
 sys.stdout.flush()
@@ -66,6 +49,8 @@ print("LOT_SIZE:", LOT_SIZE)
 print("SLEEP_SECONDS:", SLEEP_SECONDS)
 print("ENTRY_MULTIPLIER:", ENTRY_MULTIPLIER)
 print("MAX_REENTRY_SIZE:", MAX_REENTRY_SIZE)
+print("SERIES_STEP:", SERIES_STEP)
+print("SERIES_ADD_LOT:", SERIES_ADD_LOT)
 sys.stdout.flush()
 
 if not API_KEY or not API_SECRET:
@@ -106,9 +91,13 @@ def default_state():
     return {
         "levels": [],
 
+        # cycle multiplier entry tracking
         "cycle_entry_size": None,
         "cycle_entry_price": None,
         "cycle_entry_sell_price": None,
+
+        # cycle base series tracking (dynamic)
+        "cycle_base_series": None,
 
         "last_action": None,
         "last_action_price": None,
@@ -312,6 +301,59 @@ def mark_action(action, price, order_id=None):
 
 
 # ============================================================
+# SERIES LOT SIZE CALCULATION (DYNAMIC, NOT FIXED)
+# ============================================================
+
+def get_series_base(price):
+    """
+    SERIES_STEP=100
+    5200 -> 5200
+    5185 -> 5100
+    5005 -> 5000
+    4999 -> 4900
+    """
+    if SERIES_STEP <= 0:
+        return None
+    return math.floor(float(price) / SERIES_STEP) * SERIES_STEP
+
+
+def calculate_dynamic_lot(price):
+    """
+    LOT_SIZE changes only when price goes BELOW cycle_base_series.
+    If price goes ABOVE cycle series, it stays base LOT_SIZE.
+    """
+    base_lot = float(LOT_SIZE)
+
+    if SERIES_ADD_LOT <= 0:
+        return base_lot
+
+    if SERIES_STEP <= 0:
+        return base_lot
+
+    cycle_series = state.get("cycle_base_series")
+    if cycle_series is None:
+        return base_lot
+
+    current_series = get_series_base(price)
+    if current_series is None:
+        return base_lot
+
+    # steps down from cycle series
+    steps_down = int((cycle_series - current_series) / SERIES_STEP)
+
+    # if price above cycle series => no add lot
+    if steps_down < 0:
+        steps_down = 0
+
+    dynamic_lot = base_lot + (steps_down * float(SERIES_ADD_LOT))
+
+    if dynamic_lot < base_lot:
+        dynamic_lot = base_lot
+
+    return float(dynamic_lot)
+
+
+# ============================================================
 # LEVEL MANAGEMENT
 # ============================================================
 
@@ -377,6 +419,7 @@ def reduce_closest_sell_level(fill_price, sold_size):
     if closest_index is None:
         return None
 
+    # tolerance to handle slippage / manual sell fill mismatch
     if closest_diff > 3.0:
         return None
 
@@ -415,9 +458,12 @@ def get_next_sell_target(price):
 
 def reset_all_levels():
     state["levels"] = []
+
     state["cycle_entry_size"] = None
     state["cycle_entry_price"] = None
     state["cycle_entry_sell_price"] = None
+    state["cycle_base_series"] = None
+
     save_state(state)
 
 
@@ -440,7 +486,7 @@ def calculate_reentry_size():
 
 
 # ============================================================
-# PROCESS NEW FILLS
+# PROCESS NEW FILLS (MANUAL + PARTIAL + MULTI-FILL)
 # ============================================================
 
 def process_new_fills():
@@ -479,7 +525,6 @@ def process_new_fills():
         sys.stdout.flush()
 
         if fill_side == "buy":
-            # cycle buy detection
             if state.get("cycle_entry_size") is not None and abs(fill_size - state["cycle_entry_size"]) < 0.01:
                 add_level(fill_price, fill_size, is_cycle=True)
             else:
@@ -528,6 +573,7 @@ def safe_recover_from_last_buy(pos_size):
     state["cycle_entry_size"] = pos_size
     state["cycle_entry_price"] = buy_price
     state["cycle_entry_sell_price"] = buy_price + GRID
+    state["cycle_base_series"] = get_series_base(buy_price)
     save_state(state)
 
     add_level(buy_price, pos_size, is_cycle=True)
@@ -547,7 +593,6 @@ def mismatch_protection_check():
         safe_recover_from_last_buy(pos_size)
         return
 
-    # mismatch tolerance 0.01
     if abs(total_levels - pos_size) > 0.01:
         print("POSITION MISMATCH DETECTED !!!")
         print("EXCHANGE POS:", pos_size, "STATE LEVEL SUM:", total_levels)
@@ -555,6 +600,15 @@ def mismatch_protection_check():
         sys.stdout.flush()
 
         safe_recover_from_last_buy(pos_size)
+
+    # if cycle_base_series missing but position exists -> recover it
+    if state.get("cycle_base_series") is None:
+        print("CYCLE BASE SERIES MISSING -> FIXING FROM LAST BUY")
+        sys.stdout.flush()
+        last_buy = get_last_buy_fill()
+        if last_buy:
+            state["cycle_base_series"] = get_series_base(float(last_buy["price"]))
+            save_state(state)
 
 
 # ============================================================
@@ -591,17 +645,19 @@ try:
             GRID = float(os.getenv("GRID", "15"))
             ENTRY_MULTIPLIER = float(os.getenv("ENTRY_MULTIPLIER", "10"))
             MAX_REENTRY_SIZE = float(os.getenv("MAX_REENTRY_SIZE", "200"))
+            SERIES_STEP = float(os.getenv("SERIES_STEP", "100"))
+            SERIES_ADD_LOT = float(os.getenv("SERIES_ADD_LOT", "0"))
 
             process_new_fills()
-
-            # mismatch check every loop (important)
             mismatch_protection_check()
 
             price = get_live_price()
             pos_size = get_open_position_size()
 
+            dynamic_lot = calculate_dynamic_lot(price)
+
             now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            print(f"{now} PRICE:{price} POS:{pos_size} NEXT_BUY:{get_next_buy_price()} LEVELS:{state.get('levels')}")
+            print(f"{now} PRICE:{price} POS:{pos_size} CYCLE_SERIES:{state.get('cycle_base_series')} DYNAMIC_LOT:{dynamic_lot} NEXT_BUY:{get_next_buy_price()} LEVELS:{state.get('levels')}")
             sys.stdout.flush()
 
             # ============================================================
@@ -632,6 +688,7 @@ try:
 
                     state["cycle_entry_price"] = fill_price
                     state["cycle_entry_sell_price"] = fill_price + GRID
+                    state["cycle_base_series"] = get_series_base(fill_price)
                     save_state(state)
 
                 time.sleep(SLEEP_SECONDS)
@@ -651,10 +708,12 @@ try:
                 if already_executed_same_price("buy", next_buy):
                     break
 
-                print("GRID BUY TRIGGERED AT:", next_buy)
+                dynamic_lot = calculate_dynamic_lot(next_buy)
+
+                print("GRID BUY TRIGGERED AT:", next_buy, "BUY SIZE:", dynamic_lot)
                 sys.stdout.flush()
 
-                resp = place_market_order("buy", LOT_SIZE)
+                resp = place_market_order("buy", dynamic_lot)
 
                 if resp.get("success") is True:
                     order_id = resp.get("result", {}).get("id")
@@ -681,7 +740,6 @@ try:
                 if already_executed_same_price("sell", sell_price):
                     break
 
-                # strict no short
                 sell_size = min(sell_size, pos_size)
 
                 if sell_size <= 0:
@@ -719,4 +777,4 @@ except KeyboardInterrupt:
     sys.stdout.flush()
 
 finally:
-    release_
+    release_lock()
