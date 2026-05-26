@@ -68,13 +68,14 @@ SERIES_ADD_LOT = float(os.getenv("SERIES_ADD_LOT", "0"))
 REENTRY_COOLDOWN_SECONDS = int(os.getenv("REENTRY_COOLDOWN_SECONDS", "15"))
 NEGATIVE_POS_WAIT_SECONDS = int(os.getenv("NEGATIVE_POS_WAIT_SECONDS", "15"))
 RECOVERY_FILL_SCAN = int(os.getenv("RECOVERY_FILL_SCAN", "800"))
+PENDING_ORDER_WAIT_SECONDS = int(os.getenv("PENDING_ORDER_WAIT_SECONDS", "60"))
 
 API_KEY = os.getenv("DELTA_API_KEY")
 API_SECRET = os.getenv("DELTA_API_SECRET")
 
 STATE_FILE = "state.json"
 LOCK_FILE = "bot.lock"
-STATE_SCHEMA_VERSION = 2
+STATE_SCHEMA_VERSION = 3
 
 USER_AGENT = "xautusd-grid-bot-FULL-FINAL-NO-SHORT-MANUALSAFE"
 
@@ -94,6 +95,7 @@ print("SERIES_ADD_LOT:", SERIES_ADD_LOT)
 print("REENTRY_COOLDOWN_SECONDS:", REENTRY_COOLDOWN_SECONDS)
 print("NEGATIVE_POS_WAIT_SECONDS:", NEGATIVE_POS_WAIT_SECONDS)
 print("RECOVERY_FILL_SCAN:", RECOVERY_FILL_SCAN)
+print("PENDING_ORDER_WAIT_SECONDS:", PENDING_ORDER_WAIT_SECONDS)
 sys.stdout.flush()
 
 if not API_KEY or not API_SECRET:
@@ -130,7 +132,7 @@ acquire_lock()
 # STATE SYSTEM
 # ============================================================
 
-state_needs_rebuild_after_upgrade = False
+state_needs_fill_bootstrap = False
 
 
 def default_state():
@@ -168,9 +170,10 @@ def default_state():
 
 
 def load_state():
-    global state_needs_rebuild_after_upgrade
+    global state_needs_fill_bootstrap
 
     if not os.path.exists(STATE_FILE):
+        state_needs_fill_bootstrap = True
         return default_state()
 
     try:
@@ -179,7 +182,7 @@ def load_state():
 
         raw_version = int(data.get("state_schema_version", 1) or 1)
         if raw_version < STATE_SCHEMA_VERSION:
-            state_needs_rebuild_after_upgrade = True
+            state_needs_fill_bootstrap = True
 
         d = default_state()
         d.update(data)
@@ -196,6 +199,8 @@ def load_state():
 
         if d.get("processed_fill_ids") is None:
             d["processed_fill_ids"] = []
+        elif not d.get("processed_fill_ids"):
+            state_needs_fill_bootstrap = True
 
         # FIX: remove duplicates safely
         unique_ids = []
@@ -215,6 +220,11 @@ def load_state():
 
         if d.get("last_grid_buy_price") is not None:
             d["last_grid_buy_price"] = float(d["last_grid_buy_price"])
+
+        # v2 had unsafe historical buyback recovery. Never carry that backlog forward.
+        if raw_version < STATE_SCHEMA_VERSION:
+            d["pending_buybacks"] = []
+            d["pending_orders"] = {}
 
         clean_buybacks = []
         for b in d.get("pending_buybacks", []):
@@ -238,6 +248,7 @@ def load_state():
 
         return d
     except:
+        state_needs_fill_bootstrap = True
         return default_state()
 
 
@@ -464,6 +475,30 @@ def consume_pending_order_fill(order_id, fill_size):
         state["pending_orders"][oid]["remaining_size"] = remaining
 
     save_state()
+
+
+def has_fresh_pending_orders():
+    pending_orders = state.get("pending_orders", {})
+    if not pending_orders:
+        return False
+
+    now = int(time.time())
+    stale_order_ids = []
+    fresh_count = 0
+
+    for oid, pending in pending_orders.items():
+        created_at = int(pending.get("created_at", 0) or 0)
+        if now - created_at <= PENDING_ORDER_WAIT_SECONDS:
+            fresh_count += 1
+        else:
+            stale_order_ids.append(oid)
+
+    if stale_order_ids:
+        for oid in stale_order_ids:
+            state["pending_orders"].pop(oid, None)
+        save_state()
+
+    return fresh_count > 0
 
 
 def mark_action(action, price, order_id=None, size=None, source=None, extra=None):
@@ -1199,6 +1234,12 @@ def mismatch_protection_check():
 
     # MANUAL TRADE SAFE MODE (MAIN FIX)
     if abs(total_levels - pos_size) > 0.01:
+        if has_fresh_pending_orders():
+            print("MISMATCH DETECTED BUT BOT ORDER IS STILL PENDING -> WAITING FOR FILL SYNC")
+            print("EXCHANGE POS:", pos_size, "STATE LEVEL SUM:", total_levels)
+            sys.stdout.flush()
+            return
+
         try:
             live_price = get_live_price()
         except:
@@ -1219,6 +1260,54 @@ def mismatch_protection_check():
             rebuild_levels_from_fills(pos_size)
 
 
+def bootstrap_current_fills_as_processed(page_size=None):
+    """
+    Critical safety guard.
+    On a fresh deploy/restart with an empty state file, Delta returns old fills.
+    Those historical fills must not be treated as new trades, otherwise old sells
+    create stale buybacks and the bot can place many immediate market buys.
+    """
+
+    global processed_fill_set
+
+    if page_size is None:
+        page_size = RECOVERY_FILL_SCAN
+
+    fills = get_fills(page_size=page_size)
+    fill_ids = []
+
+    for f in fills:
+        if f.get("product_symbol") != SYMBOL:
+            continue
+
+        fid = f.get("id")
+        if fid is None:
+            continue
+
+        fill_ids.append(fid)
+
+    if not fill_ids:
+        return
+
+    for fid in fill_ids:
+        if fid not in processed_fill_set:
+            processed_fill_set.add(fid)
+            state["processed_fill_ids"].append(fid)
+
+    # Keep startup state clean. Pending orders/buybacks are only valid if this
+    # exact bot created them in the current persisted state.
+    state["pending_orders"] = {}
+
+    if len(state["processed_fill_ids"]) > 5000:
+        state["processed_fill_ids"] = state["processed_fill_ids"][-2000:]
+
+    state["state_schema_version"] = STATE_SCHEMA_VERSION
+    save_state()
+
+    print("BOOTSTRAP SAFETY: MARKED EXISTING FILLS AS PROCESSED:", len(fill_ids))
+    sys.stdout.flush()
+
+
 def pending_buyback_exists_for_fill(fill_id):
     if fill_id is None:
         return False
@@ -1232,61 +1321,12 @@ def pending_buyback_exists_for_fill(fill_id):
 
 def recover_recent_sell_buybacks():
     """
-    Migration helper for old state files.
-    Old code removed sold lots but did not remember the buyback price.
-    We only restore sells after the latest buy in the recent fill scan, so
-    historical stale sells do not create a large backlog of immediate buys.
+    Disabled on purpose.
+    Historical sell recovery can create stale buyback orders after deployment.
+    Buybacks are created only from fresh fills processed while this bot is
+    running with a valid processed_fill_ids state.
     """
-
-    fills = get_fills(page_size=RECOVERY_FILL_SCAN)
-    fills = [f for f in fills if f.get("product_symbol") == SYMBOL]
-    fills = sorted(fills, key=lambda x: x.get("created_at", ""))
-
-    if not fills:
-        return
-
-    last_buy_index = -1
-    for i, f in enumerate(fills):
-        if f.get("side") == "buy":
-            last_buy_index = i
-
-    if last_buy_index < 0:
-        return
-
-    recovered = 0
-    for f in fills[last_buy_index + 1:]:
-        if f.get("side") != "sell":
-            continue
-
-        fid = f.get("id")
-        if pending_buyback_exists_for_fill(fid):
-            continue
-
-        try:
-            fill_price = float(f.get("price"))
-            fill_size = float(f.get("size", 0))
-        except:
-            continue
-
-        if fill_size <= 0:
-            continue
-
-        buyback_price = fill_price - GRID
-        print("RECOVER BUYBACK FROM RECENT SELL:", buyback_price, "SIZE:", fill_size, "FILL:", fid)
-        sys.stdout.flush()
-
-        add_pending_buyback(
-            buyback_price,
-            fill_size,
-            is_cycle=False,
-            source_sell_price=None,
-            source_fill_price=fill_price,
-            source_fill_id=fid
-        )
-        recovered += 1
-
-    if recovered > 0:
-        save_state()
+    return
 
 
 # ============================================================
@@ -1310,11 +1350,10 @@ try:
 
     mismatch_protection_check()
 
-    if state_needs_rebuild_after_upgrade:
-        print("STATE UPGRADE -> RECOVERING RECENT SELL BUYBACKS")
+    if state_needs_fill_bootstrap:
+        print("STATE UPGRADE/FRESH START -> BOOTSTRAPPING FILL IDS ONLY")
         sys.stdout.flush()
-        recover_recent_sell_buybacks()
-        save_state()
+        bootstrap_current_fills_as_processed()
 
 except Exception as e:
     print("STARTUP ERROR:", str(e))
@@ -1335,6 +1374,7 @@ try:
             MAX_REENTRY_SIZE = float(os.getenv("MAX_REENTRY_SIZE", "200"))
             SERIES_STEP = float(os.getenv("SERIES_STEP", "100"))
             SERIES_ADD_LOT = float(os.getenv("SERIES_ADD_LOT", "0"))
+            PENDING_ORDER_WAIT_SECONDS = int(os.getenv("PENDING_ORDER_WAIT_SECONDS", "60"))
 
             process_new_fills()
             mismatch_protection_check()
