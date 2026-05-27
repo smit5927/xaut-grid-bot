@@ -1558,7 +1558,7 @@ try:
 
                 resp = place_market_order("buy", buy_size)
 
-            if resp.get("success") is True:
+                if resp.get("success") is True:
 
                     # ============================================================
                     # RESERVE THIS GRID PRICE IMMEDIATELY
@@ -1595,7 +1595,7 @@ try:
                     if pos_size < 0:
                         break
 
-            else:
+                else:
                     break
 
                 # refresh live price for jump down multi loop
