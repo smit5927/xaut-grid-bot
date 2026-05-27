@@ -168,7 +168,7 @@ def default_state():
         "last_reentry_time": 0,
 
         # duplicate grid protection
-        "pending_grid_prices": []
+        "pending_grid_prices": {}
     }
 
 
@@ -222,7 +222,7 @@ def load_state():
             d["last_reentry_time"] = 0
 
         if d.get("pending_grid_prices") is None:
-            d["pending_grid_prices"] = []
+            d["pending_grid_prices"] = {}
 
         if d.get("last_grid_buy_price") is not None:
             d["last_grid_buy_price"] = float(d["last_grid_buy_price"])
@@ -482,6 +482,41 @@ def consume_pending_order_fill(order_id, fill_size):
 
     save_state()
 
+# ============================================================
+# CLEAN STALE RESERVED GRID PRICES
+# ============================================================
+
+def cleanup_stale_pending_grid_prices():
+
+    reserved = state.get("pending_grid_prices", {})
+
+    if not reserved:
+        return
+
+    now = int(time.time())
+
+    remove_keys = []
+
+    for key, data in reserved.items():
+
+        try:
+            created_at = int(data.get("created_at", 0))
+        except:
+            created_at = 0
+
+        # remove after 60 seconds
+        if now - created_at > 60:
+            remove_keys.append(key)
+
+    if remove_keys:
+
+        for key in remove_keys:
+            print("REMOVING STALE RESERVED PRICE:", key)
+            sys.stdout.flush()
+
+            state["pending_grid_prices"].pop(key, None)
+
+        save_state()
 
 def has_fresh_pending_orders():
     pending_orders = state.get("pending_orders", {})
@@ -505,6 +540,30 @@ def has_fresh_pending_orders():
         save_state()
 
     return fresh_count > 0
+
+def cleanup_stale_grid_reservations():
+
+    now = int(time.time())
+
+    stale_keys = []
+
+    for price_key, data in state.get("pending_grid_prices", {}).items():
+
+        created_at = int(data.get("created_at", 0))
+
+        # 60 sec expiry
+        if now - created_at > 60:
+            stale_keys.append(price_key)
+
+    if stale_keys:
+
+        for k in stale_keys:
+            del state["pending_grid_prices"][k]
+
+        save_state()
+
+        print("CLEANED STALE GRID RESERVATIONS:", stale_keys)
+        sys.stdout.flush()
 
 
 def mark_action(action, price, order_id=None, size=None, source=None, extra=None):
@@ -654,7 +713,7 @@ def reset_all_levels():
     state["levels"] = []
     state["pending_buybacks"] = []
     state["pending_orders"] = {}
-    state["pending_grid_prices"] = []
+    state["pending_grid_prices"] = {}
     state["last_grid_buy_price"] = None
     state["cycle_entry_size"] = None
     state["cycle_entry_price"] = None
@@ -751,14 +810,16 @@ def get_next_downside_buy_price():
 
 
 def get_next_buy_target():
-    reserved_prices = state.get("pending_grid_prices", [])    
+    reserved_prices = state.get("pending_grid_prices", {})    
     
     candidates = []
 
     for b in state.get("pending_buybacks", []):
 
-         # skip reserved prices
-         if any(abs(float(b["buy_price"]) - float(x)) < 0.01 for x in reserved_prices):
+        # skip reserved prices
+        price_key = str(round(float(b["buy_price"]), 2))
+
+        if price_key in reserved_prices:
             continue
 
         if float(b.get("size", 0)) > 0:
@@ -772,13 +833,12 @@ def get_next_buy_target():
 
     downside_buy = get_next_downside_buy_price()
 
-    is_reserved = any(
-       abs(float(downside_buy) - float(x)) < 0.01
-       for x in reserved_prices
-    )
+    if downside_buy is not None:
 
-    if is_reserved:
-       downside_buy = None
+         price_key = str(round(float(downside_buy), 2))
+
+         if price_key in reserved_prices:
+             downside_buy = None
 
     if downside_buy is not None:
         candidates.append({
@@ -1027,10 +1087,10 @@ def process_new_fills():
             # REMOVE RESERVED GRID PRICE AFTER BUY FILL
             # ============================================================
 
-            state["pending_grid_prices"] = [
-                x for x in state.get("pending_grid_prices", [])
-                if abs(float(x) - float(fill_price)) >= 0.01
-            ]
+            price_key = str(round(float(fill_price), 2))
+
+            if price_key in state["pending_grid_prices"]:
+                del state["pending_grid_prices"][price_key]
 
             save_state()
 
@@ -1412,6 +1472,7 @@ try:
             PENDING_ORDER_WAIT_SECONDS = int(os.getenv("PENDING_ORDER_WAIT_SECONDS", "60"))
 
             process_new_fills()
+            cleanup_stale_grid_reservations()
             mismatch_protection_check()
 
             price = get_live_price()
@@ -1470,13 +1531,10 @@ try:
             # ============================================================
             while True:
 
-                 # ============================================================
-                 # HARD DUPLICATE BUY PROTECTION
-                 # ============================================================
-                 if has_fresh_pending_orders():
-                     print("PENDING ORDER EXISTS -> WAITING")
-                     sys.stdout.flush()
-                     break
+                if has_fresh_pending_orders():
+                    print("PENDING ORDER EXISTS -> WAITING")
+                    sys.stdout.flush()
+                    break
 
                 buy_target = get_next_buy_target()
 
@@ -1500,17 +1558,23 @@ try:
 
                 resp = place_market_order("buy", buy_size)
 
-                if resp.get("success") is True:
+            if resp.get("success") is True:
 
                     # ============================================================
                     # RESERVE THIS GRID PRICE IMMEDIATELY
                     # ============================================================
 
-                     if next_buy not in state["pending_grid_prices"]:
-                     state["pending_grid_prices"].append(next_buy)
-                     save_state()
+                    price_key = str(round(float(next_buy), 2))
+
+                    state["pending_grid_prices"][price_key] = {
+                        "price": float(next_buy),
+                        "created_at": int(time.time())
+                    }
+
+                    save_state()
 
                     order_id = resp.get("result", {}).get("id")
+
                     mark_action(
                         "buy",
                         next_buy,
@@ -1527,13 +1591,15 @@ try:
                     process_new_fills()
 
                     pos_size = get_open_position_size()
+
                     if pos_size < 0:
                         break
-                else:
+
+            else:
                     break
 
                 # refresh live price for jump down multi loop
-                price = get_live_price()
+            price = get_live_price()
 
             # ============================================================
             # MULTI SELL LOOP (PRICE JUMP UP)
