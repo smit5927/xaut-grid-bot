@@ -165,7 +165,10 @@ def default_state():
         "processed_fill_ids": [],
 
         # reentry lock
-        "last_reentry_time": 0
+        "last_reentry_time": 0,
+
+        # duplicate grid protection
+        "pending_grid_prices": []
     }
 
 
@@ -217,6 +220,9 @@ def load_state():
 
         if d.get("last_reentry_time") is None:
             d["last_reentry_time"] = 0
+
+        if d.get("pending_grid_prices") is None:
+            d["pending_grid_prices"] = []
 
         if d.get("last_grid_buy_price") is not None:
             d["last_grid_buy_price"] = float(d["last_grid_buy_price"])
@@ -648,6 +654,7 @@ def reset_all_levels():
     state["levels"] = []
     state["pending_buybacks"] = []
     state["pending_orders"] = {}
+    state["pending_grid_prices"] = []
     state["last_grid_buy_price"] = None
     state["cycle_entry_size"] = None
     state["cycle_entry_price"] = None
@@ -744,9 +751,16 @@ def get_next_downside_buy_price():
 
 
 def get_next_buy_target():
+    reserved_prices = state.get("pending_grid_prices", [])    
+    
     candidates = []
 
     for b in state.get("pending_buybacks", []):
+
+         # skip reserved prices
+         if any(abs(float(b["buy_price"]) - float(x)) < 0.01 for x in reserved_prices):
+            continue
+
         if float(b.get("size", 0)) > 0:
             candidates.append({
                 "source": "buyback",
@@ -757,6 +771,15 @@ def get_next_buy_target():
             })
 
     downside_buy = get_next_downside_buy_price()
+
+    is_reserved = any(
+       abs(float(downside_buy) - float(x)) < 0.01
+       for x in reserved_prices
+    )
+
+    if is_reserved:
+       downside_buy = None
+
     if downside_buy is not None:
         candidates.append({
             "source": "downside",
@@ -999,6 +1022,18 @@ def process_new_fills():
 
             state["last_grid_buy_price"] = fill_price
             consume_pending_order_fill(order_id, fill_size)
+
+            # ============================================================
+            # REMOVE RESERVED GRID PRICE AFTER BUY FILL
+            # ============================================================
+
+            state["pending_grid_prices"] = [
+                x for x in state.get("pending_grid_prices", [])
+                if abs(float(x) - float(fill_price)) >= 0.01
+            ]
+
+            save_state()
+
 
         elif fill_side == "sell":
             sold_info = None
@@ -1434,7 +1469,17 @@ try:
             # MULTI BUY LOOP (PRICE JUMP DOWN)
             # ============================================================
             while True:
+
+                 # ============================================================
+                 # HARD DUPLICATE BUY PROTECTION
+                 # ============================================================
+                 if has_fresh_pending_orders():
+                     print("PENDING ORDER EXISTS -> WAITING")
+                     sys.stdout.flush()
+                     break
+
                 buy_target = get_next_buy_target()
+
                 if buy_target is None:
                     break
 
@@ -1456,6 +1501,15 @@ try:
                 resp = place_market_order("buy", buy_size)
 
                 if resp.get("success") is True:
+
+                    # ============================================================
+                    # RESERVE THIS GRID PRICE IMMEDIATELY
+                    # ============================================================
+
+                     if next_buy not in state["pending_grid_prices"]:
+                     state["pending_grid_prices"].append(next_buy)
+                     save_state()
+
                     order_id = resp.get("result", {}).get("id")
                     mark_action(
                         "buy",
