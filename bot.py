@@ -1374,6 +1374,9 @@ def rebuild_levels_from_fills(pos_size):
             state["levels"].append(lv)
 
     state["last_grid_buy_price"] = last_grid_buy_price
+    if open_levels:
+        first_buy = float(open_levels[0]["buy_price"])
+        state["cycle_base_series"] = get_series_floor(first_buy)
     sort_levels()
 
     print("REBUILD DONE. LEVELS:", state["levels"])
