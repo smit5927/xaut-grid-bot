@@ -153,6 +153,7 @@ def default_state():
         # duplicate guard
         "last_action": None,
         "last_action_price": None,
+        "last_action_time": 0,
         "last_order_id": None,
 
         # fill tracking
@@ -220,6 +221,9 @@ def load_state():
 
         if d.get("last_reentry_time") is None:
             d["last_reentry_time"] = 0
+        
+        if d.get("last_action_time") is None:
+            d["last_action_time"] = 0    
 
         if d.get("pending_grid_prices") is None:
             d["pending_grid_prices"] = {}
@@ -417,9 +421,29 @@ def place_market_order(side: str, size: float):
 # ============================================================
 
 def already_executed_same_price(action, price):
-    if state.get("last_action") == action and state.get("last_action_price") is not None:
-        if abs(float(state["last_action_price"]) - float(price)) < 0.01:
+
+    # ONLY prevent exact duplicate action instantly.
+    # Do NOT block future valid grid executions.
+
+    last_action = state.get("last_action")
+    last_price = state.get("last_action_price")
+
+    if last_action != action:
+        return False
+
+    if last_price is None:
+        return False
+
+    # only block within very tiny window
+    if abs(float(last_price) - float(price)) < 0.01:
+
+        now = int(time.time())
+        last_time = int(state.get("last_action_time", 0))
+
+        # only 3 sec protection
+        if now - last_time <= 3:
             return True
+
     return False
 
 
@@ -576,13 +600,23 @@ def cleanup_stale_grid_reservations():
 
 
 def mark_action(action, price, order_id=None, size=None, source=None, extra=None):
+
     state["last_action"] = action
     state["last_action_price"] = float(price)
+    state["last_action_time"] = int(time.time())
     state["last_order_id"] = order_id
+
     save_state()
 
     if order_id is not None:
-        remember_pending_order(order_id, action, price, size=size, source=source, extra=extra)
+        remember_pending_order(
+            order_id,
+            action,
+            price,
+            size=size,
+            source=source,
+            extra=extra
+        )
 
 
 # ============================================================
@@ -1512,6 +1546,46 @@ def recover_recent_sell_buybacks():
 print("STATE LOADED:", state)
 sys.stdout.flush()
 
+# ============================================================
+# AUTO CLEANUP FOR FREE RENDER RESTARTS
+# ============================================================
+
+try:
+
+    # remove stale pending orders
+    state["pending_orders"] = {}
+
+    # remove stale reserved prices
+    state["pending_grid_prices"] = {}
+
+    # remove stale buybacks older than live rebuild
+    if state.get("levels"):
+        valid_buybacks = []
+
+        for b in state.get("pending_buybacks", []):
+
+            try:
+                bp = float(b.get("buy_price"))
+
+                # keep only nearby realistic buybacks
+                if any(abs(float(lv["buy_price"]) - bp) <= GRID * 2 for lv in state["levels"]):
+                    valid_buybacks.append(b)
+
+            except:
+                pass
+
+        state["pending_buybacks"] = valid_buybacks
+
+    save_state()
+
+    print("AUTO CLEANUP COMPLETE")
+    sys.stdout.flush()
+
+except Exception as cleanup_error:
+
+    print("AUTO CLEANUP ERROR:", str(cleanup_error))
+    sys.stdout.flush()
+
 try:
     price = get_live_price()
     pos_size = get_open_position_size()
@@ -1624,7 +1698,12 @@ try:
                     break
 
                 if already_executed_same_price("buy", next_buy):
-                    break
+
+                    print("DUPLICATE BUY BLOCKED:", next_buy)
+                    sys.stdout.flush()
+
+                    price = get_live_price()
+                    continue
 
                 current_series = get_series_floor(price)
                 dynamic_lot = calculate_dynamic_lot(current_series, state.get("cycle_base_series"))
@@ -1705,6 +1784,12 @@ try:
             # MULTI SELL LOOP (PRICE JUMP UP)
             # ============================================================
             while True:
+                if has_fresh_pending_orders():
+
+                    print("PENDING SELL/BUY ORDER EXISTS -> WAITING")
+                    sys.stdout.flush()
+
+                    break
                 sell_level = get_next_sell_target(price)
                 if sell_level is None:
                     break
@@ -1713,7 +1798,12 @@ try:
                 desired_sell_size = float(sell_level["size"])
 
                 if already_executed_same_price("sell", sell_price):
-                    break
+
+                    print("DUPLICATE SELL BLOCKED:", sell_price)
+                    sys.stdout.flush()
+
+                    price = get_live_price()
+                    continue
 
                 pos_size = get_open_position_size()
                 if pos_size <= 0:
@@ -1741,12 +1831,14 @@ try:
 
                         existing_same_sell += float(lv.get("size", 0))
 
-                # if already almost exhausted -> block duplicate
+                # if already almost exhausted -> skip only this level
                 if existing_same_sell <= 0:
 
-                    print("BLOCKED DUPLICATE SELL:", sell_price)
+                    print("SELL LEVEL ALREADY EMPTY:", sell_price)
                     sys.stdout.flush()
-                    break
+
+                    price = get_live_price()
+                    continue
 
                 resp = place_market_order("sell", sell_size)
 
