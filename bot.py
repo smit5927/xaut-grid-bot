@@ -234,28 +234,32 @@ def load_state():
 
         clean_buybacks = []
 
-                for b in d.get("pending_buybacks", []):
+        for b in d.get("pending_buybacks", []):
 
-                    try:
-                        size = float(b.get("size", 0))
+            try:
+                size = float(b.get("size", 0))
 
-                        if size <= 0:
-                            continue
+                if size <= 0:
+                    continue
 
-                        clean_buybacks.append({
-                            "id": str(b.get("id") or f"legacy-{len(clean_buybacks) + 1}"),
-                            "buy_price": float(b.get("buy_price")),
-                            "size": size,
-                            "is_cycle": bool(b.get("is_cycle", False)),
-                            "source_sell_price": b.get("source_sell_price"),
-                            "source_fill_price": b.get("source_fill_price"),
-                            "source_fill_id": b.get("source_fill_id")
-                        })
+                clean_buybacks.append({
+                    "id": str(b.get("id") or f"legacy-{len(clean_buybacks) + 1}"),
+                    "buy_price": float(b.get("buy_price")),
+                    "size": size,
+                    "is_cycle": bool(b.get("is_cycle", False)),
+                    "source_sell_price": b.get("source_sell_price"),
+                    "source_fill_price": b.get("source_fill_price"),
+                    "source_fill_id": b.get("source_fill_id")
+                })
 
-                    except:
-                        continue
+            except:
+                continue
 
-        d["pending_buybacks"] = sorted(clean_buybacks, key=lambda x: float(x["buy_price"]), reverse=True)
+        d["pending_buybacks"] = sorted(
+            clean_buybacks,
+            key=lambda x: float(x["buy_price"]),
+            reverse=True
+        )
 
         return d
     except:
