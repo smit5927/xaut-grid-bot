@@ -1703,7 +1703,7 @@ try:
                     break
 
                 # refresh live price for jump down multi loop
-                        price = get_live_price()
+                price = get_live_price()
 
             # ============================================================
             # MULTI SELL LOOP (PRICE JUMP UP)
